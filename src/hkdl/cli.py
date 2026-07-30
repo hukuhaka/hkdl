@@ -1,0 +1,827 @@
+"""HKDL command-line interface."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from collections.abc import Iterable, Sequence
+
+from .authoring import Authoring
+from .config import ContractError
+from .evaluation import (
+    Evaluation,
+    EvaluationFailure,
+    EvaluationInterrupted,
+    LifecycleConflict,
+)
+from .export import Export, ExportFailure, ExportInterrupted
+from .migration import Migration
+from .recovery import Recovery, RecoveryFailure, RecoveryInterrupted
+from .runs import MAX_SEED, RunStore
+from .status import Status, render_status_tree
+from .storage import (
+    AlreadyExistsError,
+    NotFoundError,
+    OwnershipError,
+    validate_repository_root,
+)
+from .training import Training, TrainingFailure, TrainingInterrupted
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    parser = _parser()
+    args = parser.parse_args(argv)
+    try:
+        return _dispatch(args)
+    except EvaluationInterrupted as error:
+        print(f"interrupted {error.address}", file=sys.stderr)
+        return 130
+    except ExportInterrupted as error:
+        print(f"interrupted {error.address}", file=sys.stderr)
+        return 130
+    except TrainingInterrupted as error:
+        print(f"interrupted {error.address}", file=sys.stderr)
+        return 130
+    except RecoveryInterrupted as error:
+        print(f"interrupted {error.address}", file=sys.stderr)
+        return 130
+    except KeyboardInterrupt:
+        print("interrupted", file=sys.stderr)
+        return 130
+    except TrainingFailure as error:
+        address = f" for {error.address}" if error.address else ""
+        print(f"error: training failed{address}: {error}", file=sys.stderr)
+        return 6
+    except EvaluationFailure as error:
+        address = f" for {error.address}" if error.address else ""
+        print(
+            f"error: {error.action} failed{address}: {error}",
+            file=sys.stderr,
+        )
+        return 6
+    except ExportFailure as error:
+        address = f" for {error.address}" if error.address else ""
+        print(f"error: export failed{address}: {error}", file=sys.stderr)
+        return 6
+    except RecoveryFailure as error:
+        address = f" for {error.address}" if error.address else ""
+        print(
+            f"error: {error.action} recovery failed{address}: {error}", file=sys.stderr
+        )
+        return 6
+    except LifecycleConflict as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 5
+    except (AlreadyExistsError, OwnershipError) as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 5
+    except NotFoundError as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 4
+    except ContractError as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 3
+
+
+def _dispatch(args: argparse.Namespace) -> int:
+    repository = validate_repository_root()
+    if args.noun == "migrate":
+        result = Migration(repository).migrate(args.path)
+        print(f"already current {result.path} schema={result.schema_version}")
+        return 0
+
+    authoring = Authoring(repository)
+
+    if (args.noun, args.verb) == ("template", "list"):
+        templates = authoring.list_templates()
+        if args.output == "json":
+            _json(
+                {
+                    "templates": [
+                        {
+                            "name": item.manifest["name"],
+                            "version": item.manifest["version"],
+                            "type": item.manifest["type"],
+                        }
+                        for item in templates
+                    ]
+                }
+            )
+        else:
+            _table(
+                ("NAME", "VERSION", "TYPE"),
+                (
+                    (
+                        item.manifest["name"],
+                        item.manifest["version"],
+                        item.manifest["type"],
+                    )
+                    for item in templates
+                ),
+            )
+        return 0
+
+    if (args.noun, args.verb) == ("template", "show"):
+        template = authoring.show_template(args.reference)
+        payload = {
+            "name": template.manifest["name"],
+            "version": template.manifest["version"],
+            "type": template.manifest["type"],
+            "digest": template.bundle_digest,
+        }
+        if args.output == "json":
+            _json({"template": payload})
+        else:
+            for key, value in payload.items():
+                print(f"{key}: {value}")
+        return 0
+
+    if (args.noun, args.verb) == ("experiment", "create"):
+        record = authoring.create_experiment(args.experiment, args.template)
+        print(f"created experiment {record.document['name']}")
+        return 0
+
+    if (args.noun, args.verb) == ("experiment", "list"):
+        experiments = authoring.list_experiments()
+        if args.output == "json":
+            _json(
+                {
+                    "experiments": [
+                        {
+                            "name": item.document["name"],
+                            "type": item.document["type"],
+                            "template": {
+                                "name": item.document["template"]["name"],
+                            },
+                        }
+                        for item in experiments
+                    ]
+                }
+            )
+        else:
+            _table(
+                ("NAME", "TYPE", "TEMPLATE"),
+                (
+                    (
+                        item.document["name"],
+                        item.document["type"],
+                        item.document["template"]["name"],
+                    )
+                    for item in experiments
+                ),
+            )
+        return 0
+
+    if (args.noun, args.verb) == ("variant", "create"):
+        record = authoring.create_variant(
+            args.experiment,
+            args.variant,
+            template_version=args.template_version,
+        )
+        print(f"created variant {record.experiment}/{record.document['name']}")
+        return 0
+
+    if (args.noun, args.verb) == ("variant", "clone"):
+        record = authoring.clone_variant(
+            args.experiment,
+            args.variant,
+            source_variant=args.source,
+            source_experiment=args.source_experiment,
+        )
+        print(f"created variant {record.experiment}/{record.document['name']}")
+        return 0
+
+    if (args.noun, args.verb) == ("variant", "list"):
+        variants = authoring.list_variants(args.experiment)
+        if args.output == "json":
+            _json(
+                {
+                    "experiment": args.experiment,
+                    "variants": [{"name": item.document["name"]} for item in variants],
+                }
+            )
+        else:
+            _table(
+                ("NAME",),
+                ((item.document["name"],) for item in variants),
+            )
+        return 0
+
+    if (args.noun, args.verb) == ("variant", "check"):
+        record = authoring.check_variant(args.experiment, args.variant)
+        if args.output == "json":
+            _json(
+                {
+                    "experiment": record.experiment,
+                    "variant": record.document["name"],
+                    "valid": True,
+                }
+            )
+        else:
+            print(f"valid {record.experiment}/{record.document['name']}")
+        return 0
+
+    if (args.noun, args.verb) == ("run", "train"):
+        failed = False
+        training = Training(authoring.repository)
+        for seed in args.seeds:
+            try:
+                record = training.train(
+                    args.experiment,
+                    args.variant,
+                    args.training_group,
+                    seed=seed,
+                    device=args.device,
+                )
+            except TrainingFailure as error:
+                address = f" for {error.address}" if error.address else ""
+                print(
+                    f"error: training failed{address}: {error}",
+                    file=sys.stderr,
+                )
+                failed = True
+                continue
+            print(
+                f"trained {record.address} "
+                f"model={record.state['result']['model_id']} "
+                f"group={record.request['target']['training_group']} "
+                f"seed={record.request['target']['seed']}"
+            )
+        return 6 if failed else 0
+
+    if (args.noun, args.verb) == ("run", "eval"):
+        records = Evaluation(authoring.repository).evaluate(
+            args.experiment,
+            args.variant,
+            args.training_group,
+            args.evaluation_case,
+            seed=args.seed,
+            device=args.device,
+        )
+        if not records:
+            print(
+                f"no evaluations needed "
+                f"{args.experiment}/{args.variant}/{args.training_group}/"
+                f"{args.evaluation_case}"
+            )
+        for record in records:
+            print(
+                f"evaluated {record.address} "
+                f"model={record.request['target']['model_id']} "
+                f"case={record.request['target']['evaluation_case']}"
+            )
+        return 0
+
+    if (args.noun, args.verb) == ("run", "export"):
+        record = Export(authoring.repository).export(
+            args.experiment,
+            args.variant,
+            args.model_id,
+            device=args.device,
+        )
+        print(f"exported {record.address} model={record.request['target']['model_id']}")
+        return 0
+
+    if (args.noun, args.verb) == ("run", "retry"):
+        record = Recovery(authoring.repository).retry(
+            args.experiment,
+            args.variant,
+            args.run_id,
+        )
+        action = record.request["action"]
+        if action == "train":
+            print(
+                f"trained {record.address} "
+                f"model={record.state['result']['model_id']} "
+                f"group={record.request['target']['training_group']} "
+                f"seed={record.request['target']['seed']}"
+            )
+        elif action == "eval":
+            print(
+                f"evaluated {record.address}"
+                f" model={record.request['target']['model_id']}"
+                f" case={record.request['target']['evaluation_case']}"
+            )
+        else:
+            print(
+                f"exported {record.address} "
+                f"model={record.request['target']['model_id']}"
+            )
+        return 0
+
+    if (args.noun, args.verb) == ("model", "list"):
+        models = RunStore(authoring.repository).scan_models(
+            experiment=args.experiment,
+            variant=args.variant,
+        )
+        payload = [
+            {
+                "model_id": item.document["model_id"],
+                "training_group": item.document["training_group"],
+                "seed": item.document["seed"],
+                "producer_run": item.document["producer_run"],
+                "created_at": item.document["created_at"],
+            }
+            for item in models
+        ]
+        if args.output == "json":
+            _json(
+                {
+                    "experiment": args.experiment,
+                    "variant": args.variant,
+                    "models": payload,
+                }
+            )
+        else:
+            _table(
+                ("MODEL", "GROUP", "SEED", "RUN", "CREATED"),
+                (
+                    (
+                        item["model_id"],
+                        item["training_group"],
+                        item["seed"],
+                        item["producer_run"],
+                        item["created_at"],
+                    )
+                    for item in payload
+                ),
+            )
+        return 0
+
+    if (args.noun, args.verb) == ("model", "show"):
+        model = RunStore(authoring.repository).load_model(
+            args.experiment,
+            args.variant,
+            args.model_id,
+        )
+        if args.output == "json":
+            _json({"model": model.document})
+        else:
+            for key in (
+                "model_id",
+                "training_group",
+                "seed",
+                "device",
+                "producer_run",
+                "created_at",
+            ):
+                print(f"{key}: {model.document[key]}")
+        return 0
+
+    if args.noun == "status":
+        document = Status(authoring.repository).query(
+            experiment=args.experiment,
+            variant=args.variant,
+            run_id=args.run_id,
+        )
+        if args.output == "json":
+            _json(document)
+        else:
+            sys.stdout.write(render_status_tree(document))
+        return 0
+
+    raise AssertionError("unreachable command")
+
+
+def _parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="hkdl",
+        description="Author and run reproducible ML experiments.",
+    )
+    nouns = parser.add_subparsers(title="commands", dest="noun", required=True)
+
+    template = nouns.add_parser(
+        "template",
+        help="Inspect available Templates",
+        description="Inspect Template bundles available in this checkout.",
+    )
+    template_verbs = template.add_subparsers(
+        title="commands",
+        dest="verb",
+        required=True,
+    )
+    template_list = template_verbs.add_parser(
+        "list",
+        help="List available Template versions",
+        description="List available Template versions.",
+        epilog=_examples("hkdl template list", "hkdl template list -o json"),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    _output_argument(template_list)
+    template_show = template_verbs.add_parser(
+        "show",
+        help="Show one Template version",
+        description="Show one Template version and its bundle digest.",
+        epilog=_examples("hkdl template show resnet18@1.0.0"),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    template_show.add_argument(
+        "reference",
+        metavar="TEMPLATE@VERSION",
+        help="Template reference",
+    )
+    _output_argument(template_show)
+
+    experiment = nouns.add_parser(
+        "experiment",
+        help="Create and inspect Experiments",
+        description="Create and inspect authored Experiments.",
+    )
+    experiment_verbs = experiment.add_subparsers(
+        title="commands",
+        dest="verb",
+        required=True,
+    )
+    experiment_create = experiment_verbs.add_parser(
+        "create",
+        help="Create an Experiment",
+        description="Create an Experiment for a Template family.",
+        epilog=_examples("hkdl experiment create smoke -t resnet18"),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    experiment_create.add_argument(
+        "experiment",
+        metavar="EXPERIMENT",
+        help="Experiment name",
+    )
+    experiment_create.add_argument(
+        "-t",
+        "--template",
+        required=True,
+        metavar="TEMPLATE",
+        help="Template family name",
+    )
+    experiment_list = experiment_verbs.add_parser(
+        "list",
+        help="List authored Experiments",
+        description="List authored Experiments.",
+        epilog=_examples("hkdl experiment list", "hkdl experiment list -o json"),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    _output_argument(experiment_list)
+
+    variant = nouns.add_parser(
+        "variant",
+        help="Create, clone, and validate Variants",
+        description="Create, clone, inspect, and validate authored Variants.",
+    )
+    variant_verbs = variant.add_subparsers(
+        title="commands",
+        dest="verb",
+        required=True,
+    )
+    variant_create = variant_verbs.add_parser(
+        "create",
+        help="Create a Variant",
+        description="Create a Variant from a Template version.",
+        epilog=_examples("hkdl variant create smoke baseline"),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    _experiment_argument(variant_create)
+    _variant_argument(variant_create, help_text="Variant name")
+    variant_create.add_argument(
+        "--template-version",
+        metavar="VERSION",
+        help="Exact Template version; defaults to the latest numeric version",
+    )
+    variant_clone = variant_verbs.add_parser(
+        "clone",
+        help="Clone an existing Variant",
+        description="Clone an existing Variant and its source.",
+        epilog=_examples(
+            "hkdl variant clone smoke tuned -f baseline",
+            ("hkdl variant clone target tuned -f baseline --from-experiment source"),
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    _experiment_argument(variant_clone)
+    _variant_argument(variant_clone, help_text="Target Variant name")
+    variant_clone.add_argument(
+        "-f",
+        "--from",
+        dest="source",
+        required=True,
+        metavar="VARIANT",
+        help="Source Variant name",
+    )
+    variant_clone.add_argument(
+        "--from-experiment",
+        dest="source_experiment",
+        metavar="EXPERIMENT",
+        help="Source Experiment; defaults to the target Experiment",
+    )
+    variant_list = variant_verbs.add_parser(
+        "list",
+        help="List Variants",
+        description="List Variants owned by an Experiment.",
+        epilog=_examples("hkdl variant list smoke", "hkdl variant list smoke -o json"),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    _experiment_argument(variant_list)
+    _output_argument(variant_list)
+    variant_check = variant_verbs.add_parser(
+        "check",
+        help="Validate a Variant",
+        description="Validate one authored Variant.",
+        epilog=_examples("hkdl variant check smoke baseline"),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    _experiment_argument(variant_check)
+    _variant_argument(variant_check, help_text="Variant name")
+    _output_argument(variant_check)
+
+    model = nouns.add_parser(
+        "model",
+        help="Inspect trained Models",
+        description="Inspect immutable Models produced by Train Runs.",
+    )
+    model_verbs = model.add_subparsers(
+        title="commands",
+        dest="verb",
+        required=True,
+    )
+    model_list = model_verbs.add_parser(
+        "list",
+        help="List Models",
+        description="List Models owned by one Variant.",
+        epilog=_examples("hkdl model list smoke baseline"),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    _experiment_argument(model_list)
+    _variant_argument(model_list, help_text="Variant owning the Models")
+    _output_argument(model_list)
+    model_show = model_verbs.add_parser(
+        "show",
+        help="Show one Model",
+        description="Show one immutable Model manifest.",
+        epilog=_examples(
+            "hkdl model show smoke baseline model-0123456789abcdef0123456789abcdef"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    _experiment_argument(model_show)
+    _variant_argument(model_show, help_text="Variant owning the Model")
+    _model_argument(model_show)
+    _output_argument(model_show)
+
+    run = nouns.add_parser(
+        "run",
+        help="Execute Variants",
+        description="Execute authored Variants.",
+    )
+    run_verbs = run.add_subparsers(title="commands", dest="verb", required=True)
+    run_train = run_verbs.add_parser(
+        "train",
+        help="Train a Variant",
+        description="Train a Variant and create a persistent Run.",
+        epilog=_examples(
+            "hkdl run train smoke baseline stability",
+            "hkdl run train smoke baseline stability -s 0,1,2 -d cpu",
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    _experiment_argument(run_train)
+    _variant_argument(run_train, help_text="Variant to train")
+    run_train.add_argument(
+        "training_group",
+        metavar="GROUP",
+        help="Training Group name",
+    )
+    _train_seed_argument(run_train)
+    _device_argument(run_train)
+
+    run_eval = run_verbs.add_parser(
+        "eval",
+        help="Evaluate Models in a Training Group",
+        description="Create Eval Runs for selected Models and one Evaluation Case.",
+        epilog=_examples(
+            "hkdl run eval smoke baseline stability clean",
+            "hkdl run eval smoke baseline stability clean -s all",
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    _experiment_argument(run_eval)
+    _variant_argument(run_eval, help_text="Variant owning the Models")
+    run_eval.add_argument("training_group", metavar="GROUP")
+    run_eval.add_argument("evaluation_case", metavar="CASE")
+    _eval_seed_argument(run_eval)
+    _device_argument(run_eval)
+
+    run_export = run_verbs.add_parser(
+        "export",
+        help="Export one Model",
+        description="Create one Export Run for an immutable Model.",
+        epilog=_examples(
+            "hkdl run export smoke baseline model-0123456789abcdef0123456789abcdef"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    _experiment_argument(run_export)
+    _variant_argument(run_export, help_text="Variant owning the Model")
+    _model_argument(run_export)
+    _device_argument(run_export)
+
+    run_retry = run_verbs.add_parser(
+        "retry",
+        help="Retry a stopped action as a new Run",
+        description="Create one new Run from a failed, interrupted, or abandoned Run.",
+        epilog=_examples("hkdl run retry smoke baseline run-001"),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    _experiment_argument(run_retry)
+    _variant_argument(run_retry, help_text="Variant owning the Run")
+    _run_argument(run_retry)
+
+    status = nouns.add_parser(
+        "status",
+        help="Inspect authoritative Run state",
+        description="Show authoritative Runs grouped by Variant, Training Group, and seed.",
+        epilog=_examples(
+            "hkdl status",
+            "hkdl status smoke baseline",
+            "hkdl status smoke baseline run-001 -o json",
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    status.set_defaults(verb=None)
+    _experiment_argument(
+        status,
+        required=False,
+        help_text="Experiment filter",
+    )
+    _variant_argument(
+        status,
+        required=False,
+        help_text="Variant filter",
+    )
+    _run_argument(status, required=False)
+    _output_argument(status)
+
+    migrate = nouns.add_parser(
+        "migrate",
+        help="Inspect or migrate one authored schema",
+        description="Inspect or migrate one authored Experiment or Variant file.",
+        epilog=_examples(
+            "hkdl migrate experiments/smoke/experiment.yaml",
+            "hkdl migrate experiments/smoke/baseline/variant.yaml",
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    migrate.set_defaults(verb=None)
+    migrate.add_argument(
+        "path",
+        metavar="PATH",
+        help="Repository-owned experiment.yaml or variant.yaml",
+    )
+
+    return parser
+
+
+def _examples(*commands: str) -> str:
+    return "examples:\n" + "\n".join(f"  {command}" for command in commands)
+
+
+def _experiment_argument(
+    parser: argparse.ArgumentParser,
+    *,
+    required: bool = True,
+    help_text: str = "Experiment containing the Variant",
+) -> None:
+    parser.add_argument(
+        "experiment",
+        nargs=None if required else "?",
+        metavar="EXPERIMENT",
+        help=help_text,
+    )
+
+
+def _variant_argument(
+    parser: argparse.ArgumentParser,
+    *,
+    help_text: str,
+    required: bool = True,
+) -> None:
+    parser.add_argument(
+        "variant",
+        nargs=None if required else "?",
+        metavar="VARIANT",
+        help=help_text,
+    )
+
+
+def _run_argument(
+    parser: argparse.ArgumentParser,
+    *,
+    required: bool = True,
+) -> None:
+    parser.add_argument(
+        "run_id",
+        nargs=None if required else "?",
+        metavar="RUN",
+        help="Run ID",
+    )
+
+
+def _train_seed_argument(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "-s",
+        "--seed",
+        dest="seeds",
+        type=_parse_seed_list,
+        default=(0,),
+        metavar="SEED[,SEED...]",
+        help="One or more random seeds (default: 0)",
+    )
+
+
+def _eval_seed_argument(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "-s",
+        "--seed",
+        type=_parse_eval_seed,
+        default=None,
+        metavar="SEED|all",
+        help="One Model seed or all; inferred when the group has one Model",
+    )
+
+
+def _model_argument(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "model_id",
+        metavar="MODEL",
+        help="Model ID",
+    )
+
+
+def _parse_seed_list(value: str) -> tuple[int, ...]:
+    parts = value.split(",")
+    if not parts or any(
+        not part or not part.isascii() or not part.isdigit() for part in parts
+    ):
+        raise argparse.ArgumentTypeError("seed list must contain decimal integers")
+    seeds = tuple(int(part) for part in parts)
+    if any(seed > MAX_SEED for seed in seeds):
+        raise argparse.ArgumentTypeError(f"seed must not exceed {MAX_SEED}")
+    if len(seeds) != len(set(seeds)):
+        raise argparse.ArgumentTypeError("seed list must not contain duplicates")
+    return seeds
+
+
+def _parse_eval_seed(value: str) -> int | str:
+    if value == "all":
+        return value
+    return _parse_seed_list(value)[0] if "," not in value else _invalid_eval_seed()
+
+
+def _invalid_eval_seed():
+    raise argparse.ArgumentTypeError("evaluation seed must be one integer or all")
+
+
+def _device_argument(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "-d",
+        "--device",
+        default="auto",
+        metavar="DEVICE",
+        help="auto, cpu, mps, cuda, or cuda:N (default: auto)",
+    )
+
+
+def _output_argument(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "-o",
+        "--output",
+        choices=("text", "json"),
+        default="text",
+        help="Output format (default: text)",
+    )
+
+
+def _table(headers: tuple[str, ...], rows: Iterable[Sequence[object]]) -> None:
+    rendered_rows = [tuple(str(value) for value in row) for row in rows]
+    if any(len(row) != len(headers) for row in rendered_rows):
+        raise AssertionError("table row width does not match headers")
+
+    widths = [len(header) for header in headers]
+    for row in rendered_rows:
+        for index, value in enumerate(row):
+            widths[index] = max(widths[index], len(value))
+
+    def render(row: Sequence[str]) -> str:
+        return "  ".join(
+            value.ljust(widths[index]) if index < len(row) - 1 else value
+            for index, value in enumerate(row)
+        )
+
+    print(render(headers))
+    for row in rendered_rows:
+        print(render(row))
+
+
+def _json(payload: object) -> None:
+    print(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

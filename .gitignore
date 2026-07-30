@@ -1,0 +1,11 @@
+.DS_Store
+.venv/
+experiments/*/.venv/
+experiments/*/*/.venv/
+outputs/
+.hkdl/
+release/
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+*.py[cod]

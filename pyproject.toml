@@ -1,0 +1,31 @@
+[project]
+name = "hkdl"
+version = "1.0.0"
+description = "Local experiment management control plane"
+license = "MIT"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+  "PyYAML>=6.0.2,<7",
+]
+
+[project.scripts]
+hkdl = "hkdl.cli:main"
+
+[build-system]
+requires = ["uv_build>=0.9.27,<0.10"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+  "pytest>=8.3,<9",
+  "ruff>=0.11,<0.12",
+]
+
+[tool.pytest.ini_options]
+addopts = "-q"
+pythonpath = ["src"]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 88
+target-version = "py312"

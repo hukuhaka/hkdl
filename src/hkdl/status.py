@@ -156,6 +156,7 @@ class Status:
             "artifacts": artifacts,
             "reason": record.state["reason"],
             "tracker_run_id": record.state["tracker_run_id"],
+            "metric_summary": self.store.load_training_metric_summary(record),
             "updated_at": record.state["updated_at"],
         }
 
@@ -213,6 +214,16 @@ def render_status_tree(document: dict[str, Any]) -> str:
                             fields.append(f"reason={run['reason']}")
                         if run["tracker_run_id"] is not None:
                             fields.append(f"tracker={run['tracker_run_id']}")
+                        if run["metric_summary"]:
+                            summary = ",".join(
+                                f"{name}:{metric['last_value']}@"
+                                f"{metric['last_step']}({metric['count']})"
+                                for name, metric in sorted(
+                                    run["metric_summary"].items(),
+                                    key=lambda item: item[0].encode("utf-8"),
+                                )
+                            )
+                            fields.append(f"metrics={summary}")
                         fields.append(f"updated={run['updated_at']}")
                         lines.append(f"{seed_prefix}{branch} {'  '.join(fields)}")
     return "\n".join(lines) + "\n"

@@ -86,6 +86,94 @@ class NoopTracker:
         del name, value, step
 
 
+class ScalarTracker:
+    def __init__(self, sinks: Sequence[Any]):
+        self._sinks = sinks
+        self._history: dict[str, dict[int, float]] = {}
+
+    def log_scalar(self, name: str, value: float, step: int) -> None:
+        if (
+            not isinstance(name, str)
+            or not name
+            or isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(float(value))
+            or isinstance(step, bool)
+            or not isinstance(step, int)
+            or step < 0
+        ):
+            raise ValueError("invalid tracker scalar")
+        numeric_value = float(value)
+        history = self._history.setdefault(name, {})
+        if step in history:
+            if history[step] != numeric_value:
+                raise ValueError("tracker metric step has a conflicting value")
+            return
+        for sink in self._sinks:
+            sink.log_scalar(name, numeric_value, step)
+        history[step] = numeric_value
+
+
+class LocalTracker:
+    def __init__(self, metrics: Path):
+        if metrics.is_symlink() or not metrics.is_dir():
+            raise ValueError("Run metrics directory is invalid")
+        self._history_path = metrics / "train.jsonl"
+        self._summary_path = metrics / "train-summary.json"
+        if os.path.lexists(self._summary_path):
+            raise ValueError("local tracker summary already exists")
+        descriptor = os.open(
+            self._history_path,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_APPEND,
+            0o644,
+        )
+        self._handle = os.fdopen(descriptor, "w", encoding="utf-8")
+        self._counts: dict[str, int] = {}
+        self._last: dict[str, tuple[int, float]] = {}
+        self._closed = False
+
+    def log_scalar(self, name: str, value: float, step: int) -> None:
+        row = {
+            "schema_version": 1,
+            "name": name,
+            "step": step,
+            "value": value,
+        }
+        json.dump(
+            row,
+            self._handle,
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+        )
+        self._handle.write("\n")
+        self._handle.flush()
+        os.fsync(self._handle.fileno())
+        self._counts[name] = self._counts.get(name, 0) + 1
+        self._last[name] = (step, value)
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._handle.flush()
+        os.fsync(self._handle.fileno())
+        self._handle.close()
+        summary = {
+            "schema_version": 1,
+            "events": sum(self._counts.values()),
+            "metrics": {
+                name: {
+                    "count": self._counts[name],
+                    "last_step": self._last[name][0],
+                    "last_value": self._last[name][1],
+                }
+                for name in sorted(self._counts, key=lambda item: item.encode("utf-8"))
+            },
+        }
+        _write_json_new(self._summary_path, summary)
+        self._closed = True
+
+
 class MlflowTracker:
     def __init__(self, client: Any, run_id: str):
         self._client = client
@@ -170,6 +258,7 @@ def _dispatch(request: dict[str, Any]) -> dict[str, Any]:
     registry = _registry(entrypoint)
     selected = request["selected"]
     action = request["action"]
+    _tracker_backends(request)
     required = ACTION_COMPONENTS[action]
     _resolve(registry, selected, required)
     cfg = _freeze(request["cfg"])
@@ -250,6 +339,12 @@ def _dispatch(request: dict[str, Any]) -> dict[str, Any]:
                 "best_checkpoint": str(best),
                 "last_checkpoint": str(last),
             }
+            tracker_end(None)
+            if "local" in _tracker_backends(request):
+                response["metrics"] = {
+                    "history": "metrics/train.jsonl",
+                    "summary": "metrics/train-summary.json",
+                }
             _record_worker_done(context._attempt_path, response)
             return response
         except KeyboardInterrupt:
@@ -290,11 +385,9 @@ def _dispatch(request: dict[str, Any]) -> dict[str, Any]:
 
 
 def _validate_tracker_environment(cfg: dict[str, Any], request: dict[str, Any]) -> None:
-    tracker = cfg["variant"]["tracker"]
-    if tracker == {"backend": "none"}:
+    del cfg
+    if "mlflow" not in _tracker_backends(request):
         return
-    if tracker != {"backend": "mlflow"}:
-        raise ValueError("unsupported tracker")
     uri = _tracking_uri(Path(request["repository_root"]))
     import mlflow
 
@@ -304,7 +397,7 @@ def _validate_tracker_environment(cfg: dict[str, Any], request: dict[str, Any]) 
 
 def _ensure_mlflow_run(request: dict[str, Any]) -> dict[str, Any]:
     cfg = request["cfg"]
-    if cfg["variant"]["tracker"] != {"backend": "mlflow"}:
+    if "mlflow" not in _tracker_backends(request):
         raise ValueError("tracker operation requires mlflow")
     uri = _tracking_uri(Path(request["repository_root"]))
     import mlflow
@@ -420,30 +513,58 @@ def _external_tracker_id(value: Any) -> str:
 
 
 def _training_tracker(request: dict[str, Any]) -> tuple[Any, Any]:
-    cfg = request["cfg"]
-    if cfg["variant"]["tracker"] == {"backend": "none"}:
+    backends = _tracker_backends(request)
+    if request["action"] != "train" or not backends:
         return NoopTracker(), lambda status: None
-    if cfg["variant"]["tracker"] != {"backend": "mlflow"}:
-        raise ValueError("unsupported tracker")
-    tracker_run_id = request.get("tracker_run_id")
-    if not isinstance(tracker_run_id, str) or not tracker_run_id.startswith("mlflow:"):
-        raise ValueError("MLflow tracker identity is unavailable")
-    uri = _tracking_uri(Path(request["repository_root"]))
-    import mlflow
+    sinks: list[Any] = []
+    local = None
+    if request["action"] == "train" and "local" in backends:
+        local = LocalTracker(Path(request["run_dir"]) / "metrics")
+        sinks.append(local)
+    mlflow_module = None
+    if "mlflow" in backends:
+        tracker_run_id = request.get("tracker_run_id")
+        if not isinstance(tracker_run_id, str) or not tracker_run_id.startswith(
+            "mlflow:"
+        ):
+            raise ValueError("MLflow tracker identity is unavailable")
+        uri = _tracking_uri(Path(request["repository_root"]))
+        import mlflow
 
-    mlflow.set_tracking_uri(uri)
-    external_run_id = tracker_run_id.removeprefix("mlflow:")
-    mlflow.start_run(run_id=external_run_id)
-    client = mlflow.tracking.MlflowClient(tracking_uri=uri)
+        mlflow.set_tracking_uri(uri)
+        external_run_id = tracker_run_id.removeprefix("mlflow:")
+        mlflow.start_run(run_id=external_run_id)
+        client = mlflow.tracking.MlflowClient(tracking_uri=uri)
+        sinks.append(MlflowTracker(client, external_run_id))
+        mlflow_module = mlflow
     ended = False
 
-    def end(status: str) -> None:
+    def end(status: str | None) -> None:
         nonlocal ended
-        if not ended:
-            mlflow.end_run(status=status)
-            ended = True
+        if ended:
+            return
+        if local is not None:
+            local.close()
+        if status is not None and mlflow_module is not None:
+            mlflow_module.end_run(status=status)
+        ended = True
 
-    return MlflowTracker(client, external_run_id), end
+    return ScalarTracker(sinks), end
+
+
+def _tracker_backends(request: Mapping[str, Any]) -> tuple[str, ...]:
+    value = request.get("tracker_backends")
+    if (
+        not isinstance(value, (list, tuple))
+        or any(
+            not isinstance(item, str) or item not in {"local", "mlflow"}
+            for item in value
+        )
+        or len(value) != len(set(value))
+        or tuple(value) != tuple(item for item in ("local", "mlflow") if item in value)
+    ):
+        raise ValueError("invalid tracker backend protocol")
+    return tuple(value)
 
 
 def _tracking_uri(repository_root: Path) -> str:
@@ -549,6 +670,34 @@ def _write_journal(path: Path, document: dict[str, Any]) -> None:
             os.fsync(parent)
         finally:
             os.close(parent)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _write_json_new(path: Path, document: dict[str, Any]) -> None:
+    descriptor, name = tempfile.mkstemp(
+        dir=path.parent,
+        prefix=f".{path.name}.candidate-",
+    )
+    temporary = Path(name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            json.dump(
+                document,
+                handle,
+                ensure_ascii=False,
+                allow_nan=False,
+                separators=(",", ":"),
+            )
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.link(temporary, path)
+        path_descriptor = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(path_descriptor)
+        finally:
+            os.close(path_descriptor)
     finally:
         temporary.unlink(missing_ok=True)
 

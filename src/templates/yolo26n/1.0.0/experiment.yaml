@@ -1,0 +1,3 @@
+schema_version: 1
+type: object_detection
+question: "Does a YOLO26n object-detection baseline train and export correctly on the selected device?"

@@ -14,6 +14,7 @@ from typing import Any
 
 from .authoring import VariantRecord
 from .config import ContractError
+from .runs import validate_tracker
 from .storage import directory_lock
 
 
@@ -48,8 +49,7 @@ class VariantRuntime:
             "--no-dev",
             "--no-install-project",
         ]
-        tracker = variant.document.get("tracker")
-        if tracker == {"backend": "mlflow"}:
+        if "mlflow" in validate_tracker(variant.document.get("tracker")):
             command.extend(["--extra", "mlflow"])
         with directory_lock(variant.path) as lock_descriptor:
             result = subprocess.run(
@@ -101,6 +101,9 @@ class VariantRuntime:
                 "exec": {"seed": seed, "device": device},
                 "identity_fallback": identity_fallback or {},
                 "repository_root": str(variant.path.parents[2]),
+                "tracker_backends": list(
+                    validate_tracker(runtime_cfg["variant"]["tracker"])
+                ),
             },
         )
         if result.get("status") == "contract_error":
@@ -147,6 +150,9 @@ class VariantRuntime:
                     str(attempt_path) if attempt_path is not None else None
                 ),
                 "repository_root": str(variant.path.parents[2]),
+                "tracker_backends": list(
+                    validate_tracker(runtime_cfg["variant"]["tracker"])
+                ),
             },
             lock_descriptor=lock_descriptor,
         )
@@ -194,6 +200,9 @@ class VariantRuntime:
                 "attempt_path": (
                     str(attempt_path) if attempt_path is not None else None
                 ),
+                "tracker_backends": list(
+                    validate_tracker(runtime_cfg["variant"]["tracker"])
+                ),
             },
             lock_descriptor=lock_descriptor,
         )
@@ -237,6 +246,9 @@ class VariantRuntime:
                 "attempt_path": (
                     str(attempt_path) if attempt_path is not None else None
                 ),
+                "tracker_backends": list(
+                    validate_tracker(runtime_cfg["variant"]["tracker"])
+                ),
             },
             lock_descriptor=lock_descriptor,
         )
@@ -253,7 +265,8 @@ class VariantRuntime:
         lock_descriptor: int,
         metadata: dict[str, Any],
     ) -> str | None:
-        if cfg["variant"]["tracker"] == {"backend": "none"}:
+        tracker_backends = validate_tracker(cfg["variant"]["tracker"])
+        if "mlflow" not in tracker_backends:
             return None
         result = self._invoke(
             python,
@@ -266,6 +279,7 @@ class VariantRuntime:
                 "repository_root": str(variant.path.parents[2]),
                 "current_tracker_run_id": current_tracker_run_id,
                 "metadata": metadata,
+                "tracker_backends": list(tracker_backends),
             },
             lock_descriptor=lock_descriptor,
         )

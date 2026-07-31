@@ -68,11 +68,30 @@ class ModelRecord:
     document: dict[str, Any]
 
 
-def validate_tracker(value: Any) -> str:
+def validate_tracker(value: Any) -> tuple[str, ...]:
     tracker = _mapping(value, "variant.tracker")
-    if set(tracker) != {"backend"} or tracker["backend"] not in {"none", "mlflow"}:
-        raise ContractError("tracker must be exactly backend: none or backend: mlflow")
-    return tracker["backend"]
+    if set(tracker) != {"backend"}:
+        raise ContractError("tracker must contain only backend")
+    backend = tracker["backend"]
+    if isinstance(backend, str):
+        if backend == "none":
+            return ()
+        if backend in {"local", "mlflow"}:
+            return (backend,)
+    elif isinstance(backend, (list, tuple)):
+        if (
+            backend
+            and all(
+                isinstance(item, str) and item in {"local", "mlflow"}
+                for item in backend
+            )
+            and len(backend) == len(set(backend))
+        ):
+            return tuple(item for item in ("local", "mlflow") if item in backend)
+    raise ContractError(
+        "tracker.backend must be none, local, mlflow, or a non-empty unique list "
+        "of local and mlflow"
+    )
 
 
 def validate_training_readiness(
@@ -762,6 +781,115 @@ class RunStore:
         validate_evaluation(document, record.snapshot, record.request)
         return document
 
+    def load_training_metric_summary(
+        self,
+        record: RunRecord,
+        *,
+        required: bool | None = None,
+    ) -> dict[str, Any]:
+        if record.request["action"] != "train":
+            return {}
+        if "local" not in validate_tracker(record.snapshot["variant"]["tracker"]):
+            return {}
+        if required is None:
+            required = record.state["status"] == "done"
+        path = record.path / "metrics/train-summary.json"
+        if not os.path.lexists(path):
+            if required:
+                raise ContractError(
+                    f"completed Train Run has no metric summary: {record.address}"
+                )
+            return {}
+        _contained_regular_file(record.path, path, "Train metric summary")
+        summary = _load_json(path)
+        _validate_training_metric_summary(summary)
+        return deepcopy(summary["metrics"])
+
+    def load_training_metrics(self, record: RunRecord) -> dict[str, Any]:
+        if record.request["action"] != "train":
+            raise ContractError("Run is not a Train Run")
+        if "local" not in validate_tracker(record.snapshot["variant"]["tracker"]):
+            raise ContractError("Train Run does not use local tracking")
+        history_path = record.path / "metrics/train.jsonl"
+        if not os.path.lexists(history_path):
+            if record.state["status"] == "done":
+                raise ContractError(
+                    f"completed Train Run has no metric history: {record.address}"
+                )
+            return {"events": [], "partial": False, "summary": {}}
+        _contained_regular_file(record.path, history_path, "Train metric history")
+        events: list[dict[str, Any]] = []
+        seen: set[tuple[str, int]] = set()
+        partial = False
+        try:
+            with history_path.open("rb") as handle:
+                for line in handle:
+                    if not line.endswith(b"\n"):
+                        if record.state["status"] == "done":
+                            raise ContractError(
+                                "completed Train metric history has a partial row"
+                            )
+                        partial = True
+                        break
+                    try:
+                        row = json.loads(line)
+                    except (UnicodeError, json.JSONDecodeError) as error:
+                        raise ContractError(
+                            "Train metric history contains invalid JSON"
+                        ) from error
+                    _validate_training_metric_event(row)
+                    key = (row["name"], row["step"])
+                    if key in seen:
+                        raise ContractError(
+                            "Train metric history contains a duplicate step"
+                        )
+                    seen.add(key)
+                    events.append(row)
+        except OSError as error:
+            raise ContractError("Train metric history is unavailable") from error
+        summary_document = _training_metric_summary(events)
+        summary_path = record.path / "metrics/train-summary.json"
+        if os.path.lexists(summary_path):
+            _contained_regular_file(record.path, summary_path, "Train metric summary")
+            persisted = _load_json(summary_path)
+            _validate_training_metric_summary(persisted)
+            if persisted != summary_document:
+                raise ContractError("Train metric summary disagrees with history")
+        elif record.state["status"] == "done":
+            raise ContractError(
+                f"completed Train Run has no metric summary: {record.address}"
+            )
+        if record.state["status"] == "done" and partial:
+            raise ContractError("completed Train metric history is partial")
+        return {
+            "events": events,
+            "partial": partial,
+            "summary": summary_document["metrics"],
+        }
+
+    def validate_completed_training_metrics(
+        self,
+        record: RunRecord,
+        result: Any,
+    ) -> dict[str, str]:
+        uses_local = "local" in validate_tracker(record.snapshot["variant"]["tracker"])
+        if not uses_local:
+            if result is not None:
+                raise ContractError("Train worker returned unexpected metric files")
+            return {}
+        if not isinstance(result, dict) or result != {
+            "history": "metrics/train.jsonl",
+            "summary": "metrics/train-summary.json",
+        }:
+            raise ContractError("Train worker metric files are invalid")
+        metrics = self.load_training_metrics(record)
+        if metrics["partial"]:
+            raise ContractError("completed Train metric history is partial")
+        return {
+            relative: _file_digest(record.path / relative)
+            for relative in result.values()
+        }
+
     def direct_retry(self, record: RunRecord) -> RunRecord | None:
         matches = [
             candidate
@@ -890,6 +1018,103 @@ def _load_json(path: Path) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ContractError(f"JSON document must be a mapping: {path}")
     return value
+
+
+def _validate_training_metric_event(value: Any) -> None:
+    if not isinstance(value, dict) or set(value) != {
+        "schema_version",
+        "name",
+        "step",
+        "value",
+    }:
+        raise ContractError("Train metric event fields are invalid")
+    if (
+        isinstance(value["schema_version"], bool)
+        or not isinstance(value["schema_version"], int)
+        or value["schema_version"] != 1
+    ):
+        raise ContractError("Train metric event schema version is invalid")
+    if not isinstance(value["name"], str) or not value["name"]:
+        raise ContractError("Train metric name is invalid")
+    if (
+        isinstance(value["step"], bool)
+        or not isinstance(value["step"], int)
+        or value["step"] < 0
+    ):
+        raise ContractError("Train metric step is invalid")
+    if (
+        isinstance(value["value"], bool)
+        or not isinstance(value["value"], (int, float))
+        or not math.isfinite(float(value["value"]))
+    ):
+        raise ContractError("Train metric value is invalid")
+
+
+def _training_metric_summary(events: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    counts: dict[str, int] = {}
+    last: dict[str, tuple[int, Any]] = {}
+    for event in events:
+        name = event["name"]
+        counts[name] = counts.get(name, 0) + 1
+        last[name] = (event["step"], event["value"])
+    return {
+        "schema_version": 1,
+        "events": len(events),
+        "metrics": {
+            name: {
+                "count": counts[name],
+                "last_step": last[name][0],
+                "last_value": last[name][1],
+            }
+            for name in sorted(counts, key=lambda item: item.encode("utf-8"))
+        },
+    }
+
+
+def _validate_training_metric_summary(value: Any) -> None:
+    if not isinstance(value, dict) or set(value) != {
+        "schema_version",
+        "events",
+        "metrics",
+    }:
+        raise ContractError("Train metric summary fields are invalid")
+    if (
+        isinstance(value["schema_version"], bool)
+        or not isinstance(value["schema_version"], int)
+        or value["schema_version"] != 1
+    ):
+        raise ContractError("Train metric summary schema version is invalid")
+    if (
+        isinstance(value["events"], bool)
+        or not isinstance(value["events"], int)
+        or value["events"] < 0
+        or not isinstance(value["metrics"], dict)
+    ):
+        raise ContractError("Train metric summary is invalid")
+    total = 0
+    for name, metric in value["metrics"].items():
+        if (
+            not isinstance(name, str)
+            or not name
+            or not isinstance(metric, dict)
+            or set(metric) != {"count", "last_step", "last_value"}
+        ):
+            raise ContractError("Train metric summary entry is invalid")
+        if (
+            isinstance(metric["count"], bool)
+            or not isinstance(metric["count"], int)
+            or metric["count"] < 1
+            or isinstance(metric["last_step"], bool)
+            or not isinstance(metric["last_step"], int)
+            or metric["last_step"] < 0
+            or isinstance(metric["last_value"], bool)
+            or not isinstance(metric["last_value"], (int, float))
+            or not math.isfinite(float(metric["last_value"]))
+        ):
+            raise ContractError("Train metric summary entry is invalid")
+        total += metric["count"]
+    if total != value["events"]:
+        raise ContractError("Train metric summary event count is invalid")
 
 
 def _ensure_directory(path: Path) -> None:

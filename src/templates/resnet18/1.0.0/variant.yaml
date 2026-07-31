@@ -9,7 +9,7 @@ metrics:
   primary: accuracy
   report: [accuracy]
 tracker:
-  backend: none
+  backend: local
 components:
   model: resnet18
   loss: cross_entropy

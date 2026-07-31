@@ -22,6 +22,7 @@ from .runs import (
     evaluation_case,
     fingerprint_document,
     metric_spec,
+    validate_tracker,
     validate_evaluation_readiness,
     validate_export_readiness,
     validate_training_readiness,
@@ -857,7 +858,7 @@ class RunExecution:
         lock_descriptor: int,
     ) -> str | None:
         tracker_run_id = record.state["tracker_run_id"]
-        if record.snapshot["variant"]["tracker"] == {"backend": "mlflow"}:
+        if "mlflow" in validate_tracker(record.snapshot["variant"]["tracker"]):
             target = record.request["target"]
             metadata = {
                 "action": record.request["action"],
@@ -948,16 +949,24 @@ class RunExecution:
                 best: _file_digest(record.path / best),
                 last: _file_digest(record.path / last),
             }
+            metric_files = result.get("metrics")
+            metric_digests = self.store.validate_completed_training_metrics(
+                record,
+                metric_files,
+            )
         else:
             best = result.get("best_checkpoint")
             last = result.get("last_checkpoint")
             digests = result.get("digests")
+            metric_files = result.get("metrics")
+            metric_digests = result.get("metric_digests")
             if (
                 not isinstance(best, str)
                 or not isinstance(last, str)
                 or journal["checkpoint"] != {"best": best, "last": last}
                 or not isinstance(digests, dict)
                 or set(digests) != {best, last}
+                or not isinstance(metric_digests, dict)
             ):
                 raise ContractError("Train receipt is invalid")
             for relative in {best, last}:
@@ -974,6 +983,12 @@ class RunExecution:
                     record.path / relative
                 ):
                     raise ContractError("Train receipt checkpoint changed")
+            current_metric_digests = self.store.validate_completed_training_metrics(
+                record,
+                metric_files,
+            )
+            if metric_digests != current_metric_digests:
+                raise ContractError("Train receipt metric files changed")
         best_digest = digests[best]
         models = [
             model
@@ -1012,6 +1027,8 @@ class RunExecution:
                 "best_checkpoint": best,
                 "last_checkpoint": last,
                 "digests": digests,
+                "metrics": metric_files,
+                "metric_digests": metric_digests,
             }
             write_attempt(attempt_path, journal)
         record = self.store.update_state(

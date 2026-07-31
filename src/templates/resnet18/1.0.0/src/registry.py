@@ -196,11 +196,24 @@ class Entrypoint:
         else:
             raise ValueError("invalid action")
         variant = cfg["variant"]
-        if dict(variant["tracker"]) not in (
-            {"backend": "none"},
-            {"backend": "mlflow"},
-        ):
-            raise ValueError("tracker.backend must be none or mlflow")
+        tracker = dict(variant["tracker"])
+        if set(tracker) != {"backend"}:
+            raise ValueError("tracker must contain only backend")
+        backend = tracker["backend"]
+        if isinstance(backend, str):
+            valid_tracker = backend in {"none", "local", "mlflow"}
+        else:
+            valid_tracker = (
+                isinstance(backend, tuple)
+                and bool(backend)
+                and all(
+                    isinstance(item, str) and item in {"local", "mlflow"}
+                    for item in backend
+                )
+                and len(backend) == len(set(backend))
+            )
+        if not valid_tracker:
+            raise ValueError("invalid tracker.backend")
         dataset = variant["dataset"]
         _validate_dataset_bundle(dataset)
         if action == "train":

@@ -27,6 +27,7 @@ from .storage import (
     validate_repository_root,
 )
 from .training import Training, TrainingFailure, TrainingInterrupted
+from .update import UpdateConflict, UpdateFailure, update
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -73,6 +74,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     except LifecycleConflict as error:
         print(f"error: {error}", file=sys.stderr)
         return 5
+    except UpdateConflict as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 5
     except (AlreadyExistsError, OwnershipError) as error:
         print(f"error: {error}", file=sys.stderr)
         return 5
@@ -82,6 +86,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     except ContractError as error:
         print(f"error: {error}", file=sys.stderr)
         return 3
+    except UpdateFailure as error:
+        print(f"error: update failed: {error}", file=sys.stderr)
+        return 6
 
 
 def _dispatch(args: argparse.Namespace) -> int:
@@ -89,6 +96,9 @@ def _dispatch(args: argparse.Namespace) -> int:
     if args.noun == "migrate":
         result = Migration(repository).migrate(args.path)
         print(f"already current {result.path} schema={result.schema_version}")
+        return 0
+    if args.noun == "update":
+        update(repository, assume_yes=args.yes)
         return 0
 
     authoring = Authoring(repository)
@@ -307,6 +317,31 @@ def _dispatch(args: argparse.Namespace) -> int:
             print(
                 f"exported {record.address} "
                 f"model={record.request['target']['model_id']}"
+            )
+        return 0
+
+    if (args.noun, args.verb) == ("run", "metrics"):
+        store = RunStore(authoring.repository)
+        record = store.load(args.experiment, args.variant, args.run_id)
+        metrics = store.load_training_metrics(record)
+        if args.output == "json":
+            _json(
+                {
+                    "experiment": args.experiment,
+                    "variant": args.variant,
+                    "run_id": args.run_id,
+                    "status": record.state["status"],
+                    "partial": metrics["partial"],
+                    "metrics": metrics["events"],
+                }
+            )
+        else:
+            _table(
+                ("STEP", "METRIC", "VALUE"),
+                (
+                    (event["step"], event["name"], event["value"])
+                    for event in metrics["events"]
+                ),
             )
         return 0
 
@@ -633,6 +668,21 @@ def _parser() -> argparse.ArgumentParser:
     _variant_argument(run_retry, help_text="Variant owning the Run")
     _run_argument(run_retry)
 
+    run_metrics = run_verbs.add_parser(
+        "metrics",
+        help="Inspect local Train metric history",
+        description="Show local scalar history for one Train Run.",
+        epilog=_examples(
+            "hkdl run metrics smoke baseline run-001",
+            "hkdl run metrics smoke baseline run-001 -o json",
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    _experiment_argument(run_metrics)
+    _variant_argument(run_metrics, help_text="Variant owning the Train Run")
+    _run_argument(run_metrics)
+    _output_argument(run_metrics)
+
     status = nouns.add_parser(
         "status",
         help="Inspect authoritative Run state",
@@ -673,6 +723,21 @@ def _parser() -> argparse.ArgumentParser:
         "path",
         metavar="PATH",
         help="Repository-owned experiment.yaml or variant.yaml",
+    )
+
+    update_parser = nouns.add_parser(
+        "update",
+        help="Update this public HKDL source checkout",
+        description="Inspect and update a clean public HKDL source checkout.",
+        epilog=_examples("hkdl update", "hkdl update --yes"),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    update_parser.set_defaults(verb=None)
+    update_parser.add_argument(
+        "-y",
+        "--yes",
+        action="store_true",
+        help="Confirm the shown update without prompting",
     )
 
     return parser

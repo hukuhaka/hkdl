@@ -806,47 +806,9 @@ class RunStore:
         return deepcopy(summary["metrics"])
 
     def load_training_metrics(self, record: RunRecord) -> dict[str, Any]:
-        if record.request["action"] != "train":
-            raise ContractError("Run is not a Train Run")
-        if "local" not in validate_tracker(record.snapshot["variant"]["tracker"]):
-            raise ContractError("Train Run does not use local tracking")
-        history_path = record.path / "metrics/train.jsonl"
-        if not os.path.lexists(history_path):
-            if record.state["status"] == "done":
-                raise ContractError(
-                    f"completed Train Run has no metric history: {record.address}"
-                )
-            return {"events": [], "partial": False, "summary": {}}
-        _contained_regular_file(record.path, history_path, "Train metric history")
-        events: list[dict[str, Any]] = []
-        seen: set[tuple[str, int]] = set()
-        partial = False
-        try:
-            with history_path.open("rb") as handle:
-                for line in handle:
-                    if not line.endswith(b"\n"):
-                        if record.state["status"] == "done":
-                            raise ContractError(
-                                "completed Train metric history has a partial row"
-                            )
-                        partial = True
-                        break
-                    try:
-                        row = json.loads(line)
-                    except (UnicodeError, json.JSONDecodeError) as error:
-                        raise ContractError(
-                            "Train metric history contains invalid JSON"
-                        ) from error
-                    _validate_training_metric_event(row)
-                    key = (row["name"], row["step"])
-                    if key in seen:
-                        raise ContractError(
-                            "Train metric history contains a duplicate step"
-                        )
-                    seen.add(key)
-                    events.append(row)
-        except OSError as error:
-            raise ContractError("Train metric history is unavailable") from error
+        chunk = self.load_training_metric_chunk(record, offset=0)
+        events = chunk["events"]
+        partial = chunk["partial"]
         summary_document = _training_metric_summary(events)
         summary_path = record.path / "metrics/train-summary.json"
         if os.path.lexists(summary_path):
@@ -865,6 +827,58 @@ class RunStore:
             "events": events,
             "partial": partial,
             "summary": summary_document["metrics"],
+        }
+
+    def load_training_metric_chunk(
+        self,
+        record: RunRecord,
+        *,
+        offset: int,
+    ) -> dict[str, Any]:
+        if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
+            raise ContractError("Train metric history offset is invalid")
+        if record.request["action"] != "train":
+            raise ContractError("Run is not a Train Run")
+        if "local" not in validate_tracker(record.snapshot["variant"]["tracker"]):
+            raise ContractError("Train Run does not use local tracking")
+        history_path = record.path / "metrics/train.jsonl"
+        if not os.path.lexists(history_path):
+            if offset:
+                raise ContractError("Train metric history disappeared while following")
+            if record.state["status"] == "done":
+                raise ContractError(
+                    f"completed Train Run has no metric history: {record.address}"
+                )
+            return {"events": [], "offset": 0, "partial": False}
+        _contained_regular_file(record.path, history_path, "Train metric history")
+        events: list[dict[str, Any]] = []
+        seen: set[tuple[str, int]] = set()
+        partial = False
+        next_offset = offset
+        try:
+            with history_path.open("rb") as handle:
+                if os.fstat(handle.fileno()).st_size < offset:
+                    raise ContractError("Train metric history was truncated")
+                handle.seek(offset)
+                for line in handle:
+                    if not line.endswith(b"\n"):
+                        partial = True
+                        break
+                    row = _load_training_metric_event(line)
+                    key = (row["name"], row["step"])
+                    if key in seen:
+                        raise ContractError(
+                            "Train metric history contains a duplicate step"
+                        )
+                    seen.add(key)
+                    events.append(row)
+                    next_offset = handle.tell()
+        except OSError as error:
+            raise ContractError("Train metric history is unavailable") from error
+        return {
+            "events": events,
+            "offset": next_offset,
+            "partial": partial,
         }
 
     def validate_completed_training_metrics(
@@ -1017,6 +1031,15 @@ def _load_json(path: Path) -> dict[str, Any]:
         raise ContractError(f"invalid JSON file: {path}") from error
     if not isinstance(value, dict):
         raise ContractError(f"JSON document must be a mapping: {path}")
+    return value
+
+
+def _load_training_metric_event(line: bytes) -> dict[str, Any]:
+    try:
+        value = json.loads(line)
+    except (UnicodeError, json.JSONDecodeError) as error:
+        raise ContractError("Train metric history contains invalid JSON") from error
+    _validate_training_metric_event(value)
     return value
 
 

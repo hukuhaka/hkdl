@@ -1,14 +1,35 @@
 """HKDL command-line interface."""
+# PYTHON_ARGCOMPLETE_OK
 
 from __future__ import annotations
 
 import argparse
+import importlib.metadata
 import json
 import sys
-from collections.abc import Iterable, Sequence
+import time
+from collections.abc import Callable, Iterable, Sequence
 
 from .authoring import Authoring
 from .config import ContractError
+from .completion import (
+    SHELLS,
+    activate as activate_completion,
+    complete_devices,
+    complete_eval_seeds,
+    complete_evaluation_cases,
+    complete_experiments,
+    complete_models,
+    complete_runs,
+    complete_source_variants,
+    complete_template_references,
+    complete_template_versions,
+    complete_templates,
+    complete_training_groups,
+    complete_variants,
+    file_completer,
+    shellcode as completion_shellcode,
+)
 from .evaluation import (
     Evaluation,
     EvaluationFailure,
@@ -18,7 +39,7 @@ from .evaluation import (
 from .export import Export, ExportFailure, ExportInterrupted
 from .migration import Migration
 from .recovery import Recovery, RecoveryFailure, RecoveryInterrupted
-from .runs import MAX_SEED, RunStore
+from .runs import MAX_SEED, TERMINAL_STATUSES, RunRecord, RunStore
 from .status import Status, render_status_tree
 from .storage import (
     AlreadyExistsError,
@@ -32,7 +53,10 @@ from .update import UpdateConflict, UpdateFailure, update
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = _parser()
+    activate_completion(parser)
     args = parser.parse_args(argv)
+    if getattr(args, "follow", False) and args.output == "json":
+        parser.error("--follow requires --output text")
     try:
         return _dispatch(args)
     except EvaluationInterrupted as error:
@@ -92,6 +116,10 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 
 def _dispatch(args: argparse.Namespace) -> int:
+    if args.noun == "completion":
+        sys.stdout.write(completion_shellcode(args.shell))
+        return 0
+
     repository = validate_repository_root()
     if args.noun == "migrate":
         result = Migration(repository).migrate(args.path)
@@ -323,6 +351,9 @@ def _dispatch(args: argparse.Namespace) -> int:
     if (args.noun, args.verb) == ("run", "metrics"):
         store = RunStore(authoring.repository)
         record = store.load(args.experiment, args.variant, args.run_id)
+        if args.follow:
+            _follow_training_metrics(store, record)
+            return 0
         metrics = store.load_training_metrics(record)
         if args.output == "json":
             _json(
@@ -413,16 +444,66 @@ def _dispatch(args: argparse.Namespace) -> int:
         if args.output == "json":
             _json(document)
         else:
-            sys.stdout.write(render_status_tree(document))
+            sys.stdout.write(render_status_tree(document, full=args.full))
         return 0
 
     raise AssertionError("unreachable command")
+
+
+def _follow_training_metrics(
+    store: RunStore,
+    record: RunRecord,
+    *,
+    wait: Callable[[float], None] = time.sleep,
+) -> None:
+    experiment = record.request["experiment"]
+    variant = record.request["variant"]
+    run_id = record.request["run_id"]
+    offset = 0
+    events: list[dict[str, object]] = []
+    seen: set[tuple[str, int]] = set()
+    header_written = False
+    while True:
+        current = store.load(experiment, variant, run_id)
+        chunk = store.load_training_metric_chunk(current, offset=offset)
+        if not header_written:
+            print("STEP  METRIC  VALUE", flush=True)
+            header_written = True
+        for event in chunk["events"]:
+            key = (event["name"], event["step"])
+            if key in seen:
+                raise ContractError("Train metric history contains a duplicate step")
+            seen.add(key)
+            events.append(event)
+            print(
+                f"{event['step']}  {event['name']}  {event['value']}",
+                flush=True,
+            )
+        offset = chunk["offset"]
+        if current.state["status"] in TERMINAL_STATUSES:
+            final = store.load_training_metrics(current)
+            if final["events"] != events:
+                raise ContractError("Train metric history changed while following")
+            partial = str(final["partial"]).lower()
+            print(
+                f"run {current.address} status={current.state['status']} "
+                f"partial={partial}",
+                file=sys.stderr,
+                flush=True,
+            )
+            return
+        wait(1.0)
 
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="hkdl",
         description="Author and run reproducible ML experiments.",
+    )
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"%(prog)s {importlib.metadata.version('hkdl')}",
     )
     nouns = parser.add_subparsers(title="commands", dest="noun", required=True)
 
@@ -451,11 +532,12 @@ def _parser() -> argparse.ArgumentParser:
         epilog=_examples("hkdl template show resnet18@1.0.0"),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    template_show.add_argument(
+    template_reference = template_show.add_argument(
         "reference",
         metavar="TEMPLATE@VERSION",
         help="Template reference",
     )
+    template_reference.completer = complete_template_references
     _output_argument(template_show)
 
     experiment = nouns.add_parser(
@@ -480,13 +562,14 @@ def _parser() -> argparse.ArgumentParser:
         metavar="EXPERIMENT",
         help="Experiment name",
     )
-    experiment_create.add_argument(
+    template_name = experiment_create.add_argument(
         "-t",
         "--template",
         required=True,
         metavar="TEMPLATE",
         help="Template family name",
     )
+    template_name.completer = complete_templates
     experiment_list = experiment_verbs.add_parser(
         "list",
         help="List authored Experiments",
@@ -514,12 +597,13 @@ def _parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     _experiment_argument(variant_create)
-    _variant_argument(variant_create, help_text="Variant name")
-    variant_create.add_argument(
+    _variant_argument(variant_create, help_text="Variant name", existing=False)
+    template_version = variant_create.add_argument(
         "--template-version",
         metavar="VERSION",
         help="Exact Template version; defaults to the latest numeric version",
     )
+    template_version.completer = complete_template_versions
     variant_clone = variant_verbs.add_parser(
         "clone",
         help="Clone an existing Variant",
@@ -531,8 +615,8 @@ def _parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     _experiment_argument(variant_clone)
-    _variant_argument(variant_clone, help_text="Target Variant name")
-    variant_clone.add_argument(
+    _variant_argument(variant_clone, help_text="Target Variant name", existing=False)
+    source_variant = variant_clone.add_argument(
         "-f",
         "--from",
         dest="source",
@@ -540,12 +624,14 @@ def _parser() -> argparse.ArgumentParser:
         metavar="VARIANT",
         help="Source Variant name",
     )
-    variant_clone.add_argument(
+    source_variant.completer = complete_source_variants
+    source_experiment = variant_clone.add_argument(
         "--from-experiment",
         dest="source_experiment",
         metavar="EXPERIMENT",
         help="Source Experiment; defaults to the target Experiment",
     )
+    source_experiment.completer = complete_experiments
     variant_list = variant_verbs.add_parser(
         "list",
         help="List Variants",
@@ -618,11 +704,12 @@ def _parser() -> argparse.ArgumentParser:
     )
     _experiment_argument(run_train)
     _variant_argument(run_train, help_text="Variant to train")
-    run_train.add_argument(
+    training_group = run_train.add_argument(
         "training_group",
         metavar="GROUP",
         help="Training Group name",
     )
+    training_group.completer = complete_training_groups
     _train_seed_argument(run_train)
     _device_argument(run_train)
 
@@ -638,8 +725,10 @@ def _parser() -> argparse.ArgumentParser:
     )
     _experiment_argument(run_eval)
     _variant_argument(run_eval, help_text="Variant owning the Models")
-    run_eval.add_argument("training_group", metavar="GROUP")
-    run_eval.add_argument("evaluation_case", metavar="CASE")
+    evaluation_group = run_eval.add_argument("training_group", metavar="GROUP")
+    evaluation_group.completer = complete_training_groups
+    evaluation_case = run_eval.add_argument("evaluation_case", metavar="CASE")
+    evaluation_case.completer = complete_evaluation_cases
     _eval_seed_argument(run_eval)
     _device_argument(run_eval)
 
@@ -675,6 +764,7 @@ def _parser() -> argparse.ArgumentParser:
         epilog=_examples(
             "hkdl run metrics smoke baseline run-001",
             "hkdl run metrics smoke baseline run-001 -o json",
+            "hkdl run metrics smoke baseline run-001 --follow",
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -682,6 +772,11 @@ def _parser() -> argparse.ArgumentParser:
     _variant_argument(run_metrics, help_text="Variant owning the Train Run")
     _run_argument(run_metrics)
     _output_argument(run_metrics)
+    run_metrics.add_argument(
+        "--follow",
+        action="store_true",
+        help="Follow new local metrics until the Run becomes terminal",
+    )
 
     status = nouns.add_parser(
         "status",
@@ -707,6 +802,29 @@ def _parser() -> argparse.ArgumentParser:
     )
     _run_argument(status, required=False)
     _output_argument(status)
+    status.add_argument(
+        "--full",
+        action="store_true",
+        help="Show expanded Run details in text output",
+    )
+
+    completion = nouns.add_parser(
+        "completion",
+        help="Generate shell completion registration",
+        description="Generate shell code that registers HKDL completion.",
+        epilog=_examples(
+            'eval "$(hkdl completion zsh)"',
+            'eval "$(hkdl completion bash)"',
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    completion.set_defaults(verb=None)
+    completion.add_argument(
+        "shell",
+        choices=SHELLS,
+        metavar="SHELL",
+        help="Shell to register: bash or zsh",
+    )
 
     migrate = nouns.add_parser(
         "migrate",
@@ -719,11 +837,12 @@ def _parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     migrate.set_defaults(verb=None)
-    migrate.add_argument(
+    migrate_path = migrate.add_argument(
         "path",
         metavar="PATH",
         help="Repository-owned experiment.yaml or variant.yaml",
     )
+    migrate_path.completer = file_completer
 
     update_parser = nouns.add_parser(
         "update",
@@ -753,12 +872,13 @@ def _experiment_argument(
     required: bool = True,
     help_text: str = "Experiment containing the Variant",
 ) -> None:
-    parser.add_argument(
+    action = parser.add_argument(
         "experiment",
         nargs=None if required else "?",
         metavar="EXPERIMENT",
         help=help_text,
     )
+    action.completer = complete_experiments
 
 
 def _variant_argument(
@@ -766,13 +886,16 @@ def _variant_argument(
     *,
     help_text: str,
     required: bool = True,
+    existing: bool = True,
 ) -> None:
-    parser.add_argument(
+    action = parser.add_argument(
         "variant",
         nargs=None if required else "?",
         metavar="VARIANT",
         help=help_text,
     )
+    if existing:
+        action.completer = complete_variants
 
 
 def _run_argument(
@@ -780,12 +903,13 @@ def _run_argument(
     *,
     required: bool = True,
 ) -> None:
-    parser.add_argument(
+    action = parser.add_argument(
         "run_id",
         nargs=None if required else "?",
         metavar="RUN",
         help="Run ID",
     )
+    action.completer = complete_runs
 
 
 def _train_seed_argument(parser: argparse.ArgumentParser) -> None:
@@ -801,7 +925,7 @@ def _train_seed_argument(parser: argparse.ArgumentParser) -> None:
 
 
 def _eval_seed_argument(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument(
+    action = parser.add_argument(
         "-s",
         "--seed",
         type=_parse_eval_seed,
@@ -809,14 +933,16 @@ def _eval_seed_argument(parser: argparse.ArgumentParser) -> None:
         metavar="SEED|all",
         help="One Model seed or all; inferred when the group has one Model",
     )
+    action.completer = complete_eval_seeds
 
 
 def _model_argument(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument(
+    action = parser.add_argument(
         "model_id",
         metavar="MODEL",
         help="Model ID",
     )
+    action.completer = complete_models
 
 
 def _parse_seed_list(value: str) -> tuple[int, ...]:
@@ -844,13 +970,14 @@ def _invalid_eval_seed():
 
 
 def _device_argument(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument(
+    action = parser.add_argument(
         "-d",
         "--device",
         default="auto",
         metavar="DEVICE",
         help="auto, cpu, mps, cuda, or cuda:N (default: auto)",
     )
+    action.completer = complete_devices
 
 
 def _output_argument(parser: argparse.ArgumentParser) -> None:

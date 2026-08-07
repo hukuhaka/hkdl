@@ -16,5 +16,7 @@ uv sync \
     --reinstall-package hkdl
 .venv/bin/python -c "import hkdl"
 .venv/bin/hkdl --help >/dev/null
+.venv/bin/hkdl --version >/dev/null
+.venv/bin/hkdl completion zsh >/dev/null
 
-echo "HKDL is ready. Run: source .venv/bin/activate"
+echo "HKDL is ready. Run: source ./activate.sh"

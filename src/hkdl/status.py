@@ -4,16 +4,23 @@ from __future__ import annotations
 
 import statistics
 from collections import defaultdict
-from typing import Any
+from datetime import datetime, timezone
+from typing import Any, Callable
 
 from .config import ContractError
-from .runs import ModelRecord, RunRecord, RunStore
+from .runs import ModelRecord, RunRecord, RunStore, validate_tracker
 from .storage import RepositoryPaths
 
 
 class Status:
-    def __init__(self, repository: RepositoryPaths):
+    def __init__(
+        self,
+        repository: RepositoryPaths,
+        *,
+        now: Callable[[], datetime] | None = None,
+    ):
         self.store = RunStore(repository)
+        self._now = now or (lambda: datetime.now(timezone.utc))
 
     def query(
         self,
@@ -30,13 +37,21 @@ class Status:
             records = [self.store.load(experiment, variant, run_id)]
         else:
             records = self.store.scan(experiment=experiment, variant=variant)
-        return self._tree(records, include_all_models=run_id is None)
+        observed_at = self._now()
+        if observed_at.tzinfo is None or observed_at.utcoffset() is None:
+            raise ContractError("Status clock must be timezone-aware")
+        return self._tree(
+            records,
+            include_all_models=run_id is None,
+            observed_at=observed_at,
+        )
 
     def _tree(
         self,
         records: list[RunRecord],
         *,
         include_all_models: bool,
+        observed_at: datetime,
     ) -> dict[str, Any]:
         by_variant: dict[tuple[str, str], list[RunRecord]] = defaultdict(list)
         for record in records:
@@ -91,7 +106,7 @@ class Status:
                     model_by_id.get(record.request["target"].get("model_id")),
                     seed=seed,
                 )
-                seed_node["runs"].append(self._run_summary(record))
+                seed_node["runs"].append(self._run_summary(record, observed_at))
             group_documents: list[dict[str, Any]] = []
             for group_name in sorted(groups, key=lambda value: value.encode("utf-8")):
                 seeds = [
@@ -135,7 +150,11 @@ class Status:
             },
         )
 
-    def _run_summary(self, record: RunRecord) -> dict[str, Any]:
+    def _run_summary(
+        self,
+        record: RunRecord,
+        observed_at: datetime,
+    ) -> dict[str, Any]:
         primary = None
         values: dict[str, float] = {}
         artifacts: list[str] = []
@@ -144,6 +163,27 @@ class Status:
             primary = dict(evaluation["primary"])
             values = dict(evaluation["values"])
             artifacts = list(evaluation["artifacts"])
+        train = record.snapshot["variant"].get("train", {})
+        is_train = record.request["action"] == "train"
+
+        def configured_integer(name: str) -> int | None:
+            value = train.get(name) if is_train else None
+            return (
+                value
+                if isinstance(value, int) and not isinstance(value, bool) and value > 0
+                else None
+            )
+
+        created_at = record.request["created_at"]
+        end = (
+            observed_at
+            if record.state["status"] in {"allocated", "running"}
+            else _parse_timestamp(record.state["updated_at"])
+        )
+        elapsed_seconds = max(
+            0,
+            int((end - _parse_timestamp(created_at)).total_seconds()),
+        )
         return {
             "run_id": record.request["run_id"],
             "action": record.request["action"],
@@ -156,12 +196,23 @@ class Status:
             "artifacts": artifacts,
             "reason": record.state["reason"],
             "tracker_run_id": record.state["tracker_run_id"],
+            "tracker_backends": list(
+                validate_tracker(record.snapshot["variant"]["tracker"])
+            ),
             "metric_summary": self.store.load_training_metric_summary(record),
+            "created_at": created_at,
             "updated_at": record.state["updated_at"],
+            "elapsed_seconds": elapsed_seconds,
+            "device": record.request["exec"].get("device"),
+            "configured_batch_size": configured_integer("batch_size"),
+            "configured_steps": configured_integer("steps"),
+            "configured_epochs": configured_integer("epochs"),
+            "best_checkpoint": record.state["best_checkpoint"],
+            "last_checkpoint": record.state["last_checkpoint"],
         }
 
 
-def render_status_tree(document: dict[str, Any]) -> str:
+def render_status_tree(document: dict[str, Any], *, full: bool = False) -> str:
     experiments = document["experiments"]
     if not experiments:
         return "no runs\n"
@@ -200,7 +251,14 @@ def render_status_tree(document: dict[str, Any]) -> str:
                             run["action"],
                             run["run_id"],
                             run["status"],
+                            f"elapsed={_format_elapsed(run['elapsed_seconds'])}",
                         ]
+                        if run["configured_batch_size"] is not None:
+                            fields.append(f"batch_size={run['configured_batch_size']}")
+                        if run["configured_steps"] is not None:
+                            fields.append(f"steps={run['configured_steps']}")
+                        if run["configured_epochs"] is not None:
+                            fields.append(f"epochs={run['configured_epochs']}")
                         if run["retry_of"] is not None:
                             fields.append(f"retry_of={run['retry_of']}")
                         if run["evaluation_case"] is not None:
@@ -226,7 +284,77 @@ def render_status_tree(document: dict[str, Any]) -> str:
                             fields.append(f"metrics={summary}")
                         fields.append(f"updated={run['updated_at']}")
                         lines.append(f"{seed_prefix}{branch} {'  '.join(fields)}")
+                        if full:
+                            detail_prefix = seed_prefix + (
+                                "    " if run_last else "|   "
+                            )
+                            lines.append(
+                                f"{detail_prefix}timing: "
+                                f"created_at={run['created_at']} "
+                                f"updated_at={run['updated_at']} "
+                                f"elapsed_seconds={run['elapsed_seconds']}"
+                            )
+                            execution = f"device={run['device']}"
+                            for name in (
+                                "configured_batch_size",
+                                "configured_steps",
+                                "configured_epochs",
+                            ):
+                                if run[name] is not None:
+                                    execution += f" {name}={run[name]}"
+                            lines.append(f"{detail_prefix}execution: {execution}")
+                            lines.append(
+                                f"{detail_prefix}checkpoints: "
+                                f"best={run['best_checkpoint']} "
+                                f"last={run['last_checkpoint']}"
+                            )
+                            backends = ",".join(run["tracker_backends"]) or "none"
+                            lines.append(
+                                f"{detail_prefix}tracker: backends={backends} "
+                                f"external_run_id={run['tracker_run_id']}"
+                            )
+                            if run["metric_summary"]:
+                                for name, metric in sorted(
+                                    run["metric_summary"].items(),
+                                    key=lambda item: item[0].encode("utf-8"),
+                                ):
+                                    lines.append(
+                                        f"{detail_prefix}metric: {name} "
+                                        f"count={metric['count']} "
+                                        f"last_step={metric['last_step']} "
+                                        f"last_value={metric['last_value']}"
+                                    )
+                            else:
+                                lines.append(f"{detail_prefix}metrics: none")
+                            if run["values"]:
+                                values = ",".join(
+                                    f"{name}={value}"
+                                    for name, value in sorted(
+                                        run["values"].items(),
+                                        key=lambda item: item[0].encode("utf-8"),
+                                    )
+                                )
+                                lines.append(f"{detail_prefix}evaluation: {values}")
+                            if run["artifacts"]:
+                                lines.append(
+                                    f"{detail_prefix}artifacts: "
+                                    f"{','.join(run['artifacts'])}"
+                                )
     return "\n".join(lines) + "\n"
+
+
+def _parse_timestamp(value: str) -> datetime:
+    return datetime.fromisoformat(value.removesuffix("Z") + "+00:00")
+
+
+def _format_elapsed(total_seconds: int) -> str:
+    hours, remainder = divmod(total_seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    if hours:
+        return f"{hours}h{minutes:02d}m{seconds:02d}s"
+    if minutes:
+        return f"{minutes}m{seconds:02d}s"
+    return f"{seconds}s"
 
 
 def _model_summary(model: ModelRecord) -> dict[str, Any]:

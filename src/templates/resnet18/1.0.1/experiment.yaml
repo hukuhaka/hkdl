@@ -1,0 +1,3 @@
+schema_version: 1
+type: classification
+question: "Does a ResNet18 baseline train correctly on the selected device?"

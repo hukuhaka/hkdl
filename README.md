@@ -1,9 +1,10 @@
 # HKDL
 
 HKDL authors self-contained ML Variants and records immutable execution
-history. Version 1.0.1 supports authoring, multi-seed training, immutable
+history. Version 1.1.0 supports authoring, multi-seed training, immutable
 Models, named evaluation cases with optional result artifacts, Variant-owned
-export, new-Run retry, status projections, and opt-in MLflow tracking.
+export, new-Run retry, brief and full status projections, live local metric
+following, shell completion, and opt-in MLflow tracking.
 
 ## Setup
 
@@ -11,12 +12,31 @@ From the cloned repository root:
 
 ```text
 ./setup.sh
-source .venv/bin/activate
+source ./activate.sh
+hkdl --version
 hkdl --help
 ```
 
 `setup.sh` is the maintained environment entrypoint. It performs a locked
-root sync and verifies the installed CLI.
+root sync and verifies the installed CLI. `activate.sh` activates that root
+environment and registers completion in the current Bash or Zsh session.
+
+## Shell completion
+
+The recommended `source ./activate.sh` flow registers completion automatically.
+To register it manually after activating the environment, run only the line for
+your shell:
+
+```text
+eval "$(hkdl completion zsh)"
+eval "$(hkdl completion bash)"
+```
+
+HKDL completes commands, options, Templates, Experiments, Variants, Runs,
+Models, Training Groups, Evaluation Cases, seeds, and devices from the current
+repository. Static command and option completion also works outside a
+repository. Neither setup nor activation modifies shell startup files or
+installs completion globally; source `activate.sh` once in each new shell.
 
 ## Update
 
@@ -65,6 +85,7 @@ Inspect the reconstructed hierarchy:
 
 ```text
 hkdl status demo baseline
+hkdl status demo baseline --full
 hkdl status demo baseline --output json
 ```
 
@@ -100,17 +121,19 @@ and cannot be migrated in place.
 
 ## ResNet18 fixtures
 
-`resnet18@1.0.0` includes the attributed small TF-Flowers JPEG fixture, two
+`resnet18@1.0.1` includes the attributed small TF-Flowers JPEG fixture, two
 evaluation cases (`default` and `daisy-only`), prediction result output, ONNX
 export support, checkpoint continuation, and optional MLflow dependencies.
-It performs no dataset or pretrained-weight download at runtime.
+It records loss and per-batch wall time and performs no dataset or
+pretrained-weight download at runtime. The immutable `1.0.0` remains available.
 
 ## YOLO26n object detection
 
-`yolo26n@1.0.0` includes a deterministic synthetic shapes dataset with eight
+`yolo26n@1.0.1` includes a deterministic synthetic shapes dataset with eight
 training images, four validation images, and two classes (`circle` and
 `rectangle`). It trains the architecture from scratch for ten epochs and
-performs no dataset or pretrained-weight download at runtime.
+records loss and per-epoch wall time. It performs no dataset or
+pretrained-weight download at runtime. The immutable `1.0.0` remains available.
 
 ```text
 hkdl experiment create detection --template yolo26n
@@ -127,12 +150,24 @@ tracking integrations are disabled. HKDL remains the only tracking owner.
 
 ## Tracking
 
-New ResNet18 Variants default to `tracker.backend: local`. Training scalars are
-stored with the Run and can be inspected with:
+New bundled `1.0.1` Variants default to `tracker.backend: local`. Training
+scalars, including `train.batch_seconds` for ResNet18 and
+`train.epoch_seconds` for YOLO26n, are stored with the Run and can be inspected
+with:
 
 ```text
 .venv/bin/hkdl run metrics <experiment> <variant> <run-id>
 ```
+
+Follow an active local-tracked Train Run from another terminal:
+
+```text
+.venv/bin/hkdl run metrics <experiment> <variant> <run-id> --follow
+```
+
+Follow prints existing metric rows, then newly completed rows until the Run
+becomes terminal. It remains a read-only local view: JSON streaming, progress
+percentages, ETA, and MLflow history polling are not provided.
 
 Use `tracker.backend: none` to disable tracking, `mlflow` for MLflow only, or
 `[local, mlflow]` for both. MLflow requires an external `MLFLOW_TRACKING_URI`.

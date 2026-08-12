@@ -1,10 +1,11 @@
 # HKDL
 
 HKDL authors self-contained ML Variants and records immutable execution
-history. Version 1.1.0 supports authoring, multi-seed training, immutable
+history. Version 1.1.1 supports authoring, multi-seed training, immutable
 Models, named evaluation cases with optional result artifacts, Variant-owned
-export, new-Run retry, brief and full status projections, live local metric
-following, shell completion, and opt-in MLflow tracking.
+export, new-Run retry, brief, full, and aggregate-table status projections,
+live local metric following, Run-owned worker logs, read-only storage reporting,
+shell completion, and opt-in MLflow tracking.
 
 ## Setup
 
@@ -86,12 +87,39 @@ Inspect the reconstructed hierarchy:
 ```text
 hkdl status demo baseline
 hkdl status demo baseline --full
+hkdl status demo --table
 hkdl status demo baseline --output json
 ```
 
-Each command above creates one immutable action Run. A successful Train Run
-also creates an immutable Model. Evaluation and export target Models; they do
-not advance a shared pipeline Run.
+`--table` compares aggregate Eval results across Variants and Training Groups,
+with one row per Evaluation Case and metric. It is a text-only alternative to
+the brief and full hierarchy views.
+
+Inspect repository-owned local storage without changing it:
+
+```text
+hkdl storage
+hkdl storage --output json
+```
+
+The report separates authored Experiment content, generated Variant
+environments, and outputs. Sizes are logical file bytes; symlinks are not
+followed. The command does not delete or prune anything.
+
+Each train, evaluation, or export command above creates one immutable action
+Run. A successful Train Run also creates an immutable Model. Evaluation and
+export target Models; they do not advance a shared pipeline Run.
+
+Inspect the merged stdout and stderr captured from one action worker:
+
+```text
+hkdl run logs demo baseline run-001
+```
+
+The log also captures ordinary child processes that inherit the worker's output
+descriptors. It is raw local output with no redaction or size limit, so Variant
+code must not print secrets. Direct terminal writes and detached daemons are not
+captured. Existing Runs created before this feature may have no log.
 
 ## Retry
 

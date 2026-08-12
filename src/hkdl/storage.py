@@ -57,6 +57,62 @@ class ResolvedTemplate:
     bundle_digest: str
 
 
+def storage_usage(repository: RepositoryPaths) -> dict[str, int]:
+    """Return logical bytes for repository-owned authored and generated state."""
+
+    authored, environments = _tree_sizes(
+        repository.experiments,
+        split_environments=True,
+    )
+    outputs, _ = _tree_sizes(repository.outputs)
+    return {
+        "authored": authored,
+        "environments": environments,
+        "outputs": outputs,
+        "total": authored + environments + outputs,
+    }
+
+
+def _tree_sizes(root: Path, *, split_environments: bool = False) -> tuple[int, int]:
+    try:
+        root_stat = root.lstat()
+    except FileNotFoundError:
+        return 0, 0
+    except OSError as error:
+        raise ContractError(f"cannot inspect storage tree {root}: {error}") from error
+    if not stat.S_ISDIR(root_stat.st_mode):
+        return root_stat.st_size, 0
+
+    sizes = [0, 0]
+    pending = [(root, (), False)]
+    while pending:
+        directory, relative, in_environment = pending.pop()
+        try:
+            entries = list(os.scandir(directory))
+        except OSError as error:
+            raise ContractError(
+                f"cannot scan storage tree {directory}: {error}"
+            ) from error
+        for entry in entries:
+            entry_relative = (*relative, entry.name)
+            entry_in_environment = in_environment or (
+                split_environments
+                and len(entry_relative) == 3
+                and entry.name == ".venv"
+            )
+            try:
+                metadata = entry.stat(follow_symlinks=False)
+            except OSError as error:
+                raise ContractError(
+                    f"cannot inspect storage entry {entry.path}: {error}"
+                ) from error
+            if stat.S_ISDIR(metadata.st_mode):
+                pending.append((Path(entry.path), entry_relative, entry_in_environment))
+            else:
+                sizes[int(entry_in_environment)] += metadata.st_size
+    return sizes[0], sizes[1]
+
+
 def validate_repository_root(root: Path | None = None) -> RepositoryPaths:
     """Validate exactly one repository root without parent discovery."""
 

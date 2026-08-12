@@ -73,14 +73,19 @@ Inspect the resulting state and Models:
 ```text
 .venv/bin/hkdl status <experiment> <variant>
 .venv/bin/hkdl status <experiment> <variant> --full
+.venv/bin/hkdl status <experiment> --table
 .venv/bin/hkdl run metrics <experiment> <variant> <run-id>
+.venv/bin/hkdl run logs <experiment> <variant> <run-id>
 .venv/bin/hkdl model list <experiment> <variant>
+.venv/bin/hkdl storage
 ```
 
 `status` uses the compact brief view by default. Use `--full` for timestamps,
 configured Train dimensions, metric summaries, checkpoints, trackers, and Eval
-details. For automation, use `--output json`; JSON always returns the full
-structure, with or without `--full`.
+details. Use `--table` to compare aggregate Eval results across Variants and
+Training Groups. The table is text-only and cannot be combined with `--full`.
+For automation, use `--output json`; JSON always returns the full structure,
+with or without `--full`.
 
 Bundled `resnet18@1.0.1` and `yolo26n@1.0.1` Variants record training metrics
 locally by default. ResNet reports `train.batch_seconds` per optimizer step and
@@ -96,6 +101,16 @@ To watch new local Train metrics in an attached terminal, use:
 `--follow` is a text-only live view for locally tracked Train Runs. Use the
 regular command after completion when the full persisted metric history is
 needed.
+
+`run logs` returns the raw merged stdout and stderr captured from the action
+worker, including ordinary child processes that inherit those descriptors. It
+does not capture setup, preflight, direct terminal writes, or detached daemons.
+The log has no redaction or size limit: never print credentials, tokens, or
+other secrets from Variant code.
+
+`storage` reports logical bytes for authored Experiment content, Variant
+environments, generated outputs, and their total. It is read-only: do not
+describe it as cleanup, pruning, or available disk space.
 
 Evaluate an existing Evaluation Case:
 
@@ -125,6 +140,9 @@ When an HKDL command may outlast the current agent turn:
   `nohup` survives the host's command boundary.
 - Store logs and an atomically published exit marker under
   `.hkdl/monitors/<job-id>/`, never under `outputs/`.
+- Treat that monitor log as the whole-command lifecycle record. Run-owned
+  `worker.log` covers only action-worker output and does not replace the monitor
+  exit marker.
 - Return the terminal session or job ID, log path, and checkpoint path.
 - When the host supports scheduled follow-ups, attach a same-thread heartbeat
   that observes the exit marker and verifies final Run state with

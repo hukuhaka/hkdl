@@ -746,6 +746,13 @@ class RunStore:
         _contained_regular_file(root, path, "Model checkpoint")
         return path
 
+    def resolve_worker_log(self, record: RunRecord) -> Path:
+        path = record.path / "worker.log"
+        if not os.path.lexists(path):
+            raise NotFoundError(f"Run log not found: {record.address}")
+        _contained_regular_file(record.path, path, "Run worker log")
+        return path
+
     def evaluation_document(
         self,
         record: RunRecord,

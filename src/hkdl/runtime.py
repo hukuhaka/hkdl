@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import selectors
 import shutil
 import stat
 import subprocess
@@ -155,6 +156,7 @@ class VariantRuntime:
                 ),
             },
             lock_descriptor=lock_descriptor,
+            log_path=run_dir / "worker.log",
         )
         return _successful(result)
 
@@ -205,6 +207,7 @@ class VariantRuntime:
                 ),
             },
             lock_descriptor=lock_descriptor,
+            log_path=run_dir / "worker.log",
         )
         return _successful(result)
 
@@ -251,6 +254,7 @@ class VariantRuntime:
                 ),
             },
             lock_descriptor=lock_descriptor,
+            log_path=run_dir / "worker.log",
         )
         return _successful(result)
 
@@ -359,6 +363,7 @@ class VariantRuntime:
         request: dict[str, Any],
         *,
         lock_descriptor: int | None = None,
+        log_path: Path | None = None,
     ) -> dict[str, Any]:
         worker = Path(__file__).with_name("_runtime_worker.py")
         with tempfile.TemporaryDirectory(
@@ -372,15 +377,25 @@ class VariantRuntime:
                 json.dumps(request, ensure_ascii=False, separators=(",", ":")) + "\n",
                 encoding="utf-8",
             )
-            process = subprocess.run(
-                [str(python), str(worker), str(request_path), str(result_path)],
-                cwd=variant.path / "src",
-                stdout=sys.stderr,
-                stderr=sys.stderr,
-                check=False,
-                pass_fds=((lock_descriptor,) if lock_descriptor is not None else ()),
-            )
-            if process.returncode != 0 or not result_path.is_file():
+            command = [str(python), str(worker), str(request_path), str(result_path)]
+            pass_fds = (lock_descriptor,) if lock_descriptor is not None else ()
+            if log_path is None:
+                returncode = subprocess.run(
+                    command,
+                    cwd=variant.path / "src",
+                    stdout=sys.stderr,
+                    stderr=sys.stderr,
+                    check=False,
+                    pass_fds=pass_fds,
+                ).returncode
+            else:
+                returncode = _run_logged_worker(
+                    command,
+                    cwd=variant.path / "src",
+                    pass_fds=pass_fds,
+                    log_path=log_path,
+                )
+            if returncode != 0 or not result_path.is_file():
                 raise RuntimeFailure("Variant worker failed without a result")
             try:
                 result = json.loads(result_path.read_text(encoding="utf-8"))
@@ -389,6 +404,58 @@ class VariantRuntime:
             if not isinstance(result, dict):
                 raise RuntimeFailure("Variant worker result must be a mapping")
             return result
+
+
+def _run_logged_worker(
+    command: list[str],
+    *,
+    cwd: Path,
+    pass_fds: tuple[int, ...],
+    log_path: Path,
+) -> int:
+    with log_path.open("xb", buffering=0) as log:
+        process = subprocess.Popen(
+            command,
+            cwd=cwd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            pass_fds=pass_fds,
+        )
+        assert process.stdout is not None
+        selector = selectors.DefaultSelector()
+        selector.register(process.stdout, selectors.EVENT_READ)
+        try:
+            while True:
+                ready = selector.select(timeout=0.1)
+                if ready:
+                    chunk = os.read(process.stdout.fileno(), 64 * 1024)
+                    if not chunk:
+                        break
+                    log.write(chunk)
+                    _write_stderr(chunk)
+                elif process.poll() is not None:
+                    break
+            return process.wait()
+        except BaseException:
+            if process.poll() is None:
+                process.kill()
+            process.wait()
+            raise
+        finally:
+            selector.close()
+            process.stdout.close()
+
+
+def _write_stderr(chunk: bytes) -> None:
+    buffer = getattr(sys.stderr, "buffer", None)
+    if buffer is not None:
+        buffer.write(chunk)
+        buffer.flush()
+        return
+    sys.stderr.write(
+        chunk.decode(getattr(sys.stderr, "encoding", None) or "utf-8", errors="replace")
+    )
+    sys.stderr.flush()
 
 
 def _successful(result: dict[str, Any]) -> dict[str, Any]:

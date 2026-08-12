@@ -9,6 +9,7 @@ import json
 import sys
 import time
 from collections.abc import Callable, Iterable, Sequence
+from typing import Any
 
 from .authoring import Authoring
 from .config import ContractError
@@ -45,6 +46,7 @@ from .storage import (
     AlreadyExistsError,
     NotFoundError,
     OwnershipError,
+    storage_usage,
     validate_repository_root,
 )
 from .training import Training, TrainingFailure, TrainingInterrupted
@@ -57,6 +59,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if getattr(args, "follow", False) and args.output == "json":
         parser.error("--follow requires --output text")
+    if getattr(args, "table", False) and args.output == "json":
+        parser.error("--table requires --output text")
     try:
         return _dispatch(args)
     except EvaluationInterrupted as error:
@@ -127,6 +131,19 @@ def _dispatch(args: argparse.Namespace) -> int:
         return 0
     if args.noun == "update":
         update(repository, assume_yes=args.yes)
+        return 0
+    if args.noun == "storage":
+        usage = storage_usage(repository)
+        if args.output == "json":
+            _json({"storage": usage})
+        else:
+            _table(
+                ("CATEGORY", "BYTES", "SIZE"),
+                (
+                    (category, size, _format_bytes(size))
+                    for category, size in usage.items()
+                ),
+            )
         return 0
 
     authoring = Authoring(repository)
@@ -376,6 +393,15 @@ def _dispatch(args: argparse.Namespace) -> int:
             )
         return 0
 
+    if (args.noun, args.verb) == ("run", "logs"):
+        store = RunStore(authoring.repository)
+        record = store.load(args.experiment, args.variant, args.run_id)
+        with store.resolve_worker_log(record).open("rb") as source:
+            while chunk := source.read(64 * 1024):
+                sys.stdout.buffer.write(chunk)
+        sys.stdout.buffer.flush()
+        return 0
+
     if (args.noun, args.verb) == ("model", "list"):
         models = RunStore(authoring.repository).scan_models(
             experiment=args.experiment,
@@ -443,6 +469,8 @@ def _dispatch(args: argparse.Namespace) -> int:
         )
         if args.output == "json":
             _json(document)
+        elif getattr(args, "table", False):
+            _status_table(document)
         else:
             sys.stdout.write(render_status_tree(document, full=args.full))
         return 0
@@ -778,6 +806,17 @@ def _parser() -> argparse.ArgumentParser:
         help="Follow new local metrics until the Run becomes terminal",
     )
 
+    run_logs = run_verbs.add_parser(
+        "logs",
+        help="Inspect one Run's action-worker output",
+        description="Show merged stdout and stderr captured from one action worker.",
+        epilog=_examples("hkdl run logs smoke baseline run-001"),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    _experiment_argument(run_logs)
+    _variant_argument(run_logs, help_text="Variant owning the Run")
+    _run_argument(run_logs)
+
     status = nouns.add_parser(
         "status",
         help="Inspect authoritative Run state",
@@ -785,6 +824,7 @@ def _parser() -> argparse.ArgumentParser:
         epilog=_examples(
             "hkdl status",
             "hkdl status smoke baseline",
+            "hkdl status smoke --table",
             "hkdl status smoke baseline run-001 -o json",
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -802,11 +842,28 @@ def _parser() -> argparse.ArgumentParser:
     )
     _run_argument(status, required=False)
     _output_argument(status)
-    status.add_argument(
+    status_views = status.add_mutually_exclusive_group()
+    status_views.add_argument(
         "--full",
         action="store_true",
         help="Show expanded Run details in text output",
     )
+    status_views.add_argument(
+        "--table",
+        action="store_true",
+        default=argparse.SUPPRESS,
+        help="Show aggregate evaluation results as a table",
+    )
+
+    storage = nouns.add_parser(
+        "storage",
+        help="Inspect repository-owned storage usage",
+        description="Show logical bytes used by authored and generated HKDL state.",
+        epilog=_examples("hkdl storage", "hkdl storage -o json"),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    storage.set_defaults(verb=None)
+    _output_argument(storage)
 
     completion = nouns.add_parser(
         "completion",
@@ -1009,6 +1066,48 @@ def _table(headers: tuple[str, ...], rows: Iterable[Sequence[object]]) -> None:
     print(render(headers))
     for row in rendered_rows:
         print(render(row))
+
+
+def _format_bytes(size: int) -> str:
+    value = float(size)
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB", "PiB", "EiB"):
+        if value < 1024 or unit == "EiB":
+            return f"{size} B" if unit == "B" else f"{value:.1f} {unit}"
+        value /= 1024
+    raise AssertionError("unreachable size unit")
+
+
+def _status_table(document: dict[str, Any]) -> None:
+    _table(
+        (
+            "EXPERIMENT",
+            "VARIANT",
+            "GROUP",
+            "CASE",
+            "METRIC",
+            "COUNT",
+            "ELIGIBLE",
+            "MEAN",
+            "SAMPLE_STD",
+        ),
+        (
+            (
+                experiment["name"],
+                variant["name"],
+                group["name"],
+                aggregate["evaluation_case"],
+                aggregate["metric"],
+                aggregate["count"],
+                aggregate["eligible"],
+                aggregate["mean"],
+                aggregate["sample_std"] if aggregate["sample_std"] is not None else "-",
+            )
+            for experiment in document["experiments"]
+            for variant in experiment["variants"]
+            for group in variant["training_groups"]
+            for aggregate in group["aggregates"]
+        ),
+    )
 
 
 def _json(payload: object) -> None:

@@ -5,18 +5,18 @@ from __future__ import annotations
 import json
 import os
 import selectors
-import shutil
-import stat
 import subprocess
 import sys
 import tempfile
+import threading
 from pathlib import Path
 from typing import Any
 
 from .authoring import VariantRecord
 from .config import ContractError
+from .environments import EnvironmentFailure, EnvironmentHandle, EnvironmentStore
 from .runs import validate_tracker
-from .storage import directory_lock
+from .storage import RepositoryPaths, validate_repository_root
 
 
 class RuntimeFailure(RuntimeError):
@@ -32,45 +32,43 @@ class RuntimeOwnershipConflict(RuntimeError):
 
 
 class VariantRuntime:
-    def prepare_environment(self, variant: VariantRecord) -> Path:
-        environment = variant.path / ".venv"
-        if os.path.lexists(environment):
-            _require_real_directory(environment)
-        uv = shutil.which("uv")
-        if uv is None:
-            raise RuntimeFailure("uv is unavailable")
-        variables = os.environ.copy()
-        variables["UV_PROJECT_ENVIRONMENT"] = str(environment)
-        command = [
-            uv,
-            "sync",
-            "--project",
-            str(variant.path / "src"),
-            "--locked",
-            "--no-dev",
-            "--no-install-project",
-        ]
-        if "mlflow" in validate_tracker(variant.document.get("tracker")):
-            command.extend(["--extra", "mlflow"])
-        with directory_lock(variant.path) as lock_descriptor:
-            result = subprocess.run(
-                command,
-                env=variables,
-                text=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                check=False,
-                pass_fds=(lock_descriptor,),
-            )
-        if result.returncode != 0:
-            raise RuntimeFailure("Variant environment synchronization failed")
-        _require_real_directory(environment)
-        python = environment / (
-            "Scripts/python.exe" if os.name == "nt" else "bin/python"
+    def __init__(self, repository: RepositoryPaths | None = None):
+        self._environment_store = (
+            EnvironmentStore(repository) if repository is not None else None
         )
-        if not python.exists():
-            raise RuntimeFailure("Variant Python is unavailable")
-        return python
+        self._lease_lock = threading.Lock()
+        self._lease_descriptors: dict[Path, list[int]] = {}
+
+    def acquire_environment(self, variant: VariantRecord) -> EnvironmentHandle:
+        try:
+            environment = self._store(variant).acquire(variant)
+        except EnvironmentFailure as error:
+            raise RuntimeFailure(str(error)) from error
+        with self._lease_lock:
+            self._lease_descriptors.setdefault(environment.python, []).append(
+                environment.descriptor
+            )
+
+        def unregister(descriptor: int) -> None:
+            with self._lease_lock:
+                descriptors = self._lease_descriptors.get(environment.python, [])
+                if descriptor in descriptors:
+                    descriptors.remove(descriptor)
+                if not descriptors:
+                    self._lease_descriptors.pop(environment.python, None)
+
+        environment.on_close = unregister
+        return environment
+
+    def prepare_environment(self, variant: VariantRecord) -> Path:
+        with self.acquire_environment(variant) as environment:
+            return environment.python
+
+    def _store(self, variant: VariantRecord) -> EnvironmentStore:
+        if self._environment_store is None:
+            repository = validate_repository_root(variant.path.parents[2])
+            self._environment_store = EnvironmentStore(repository)
+        return self._environment_store
 
     def preflight(
         self,
@@ -84,6 +82,7 @@ class VariantRuntime:
         device: str,
         identity_fallback: dict[str, Any] | None = None,
         runtime_target: dict[str, Any] | None = None,
+        environment_descriptor: int | None = None,
     ) -> dict[str, Any]:
         runtime_cfg = dict(cfg)
         runtime_cfg["runtime"] = {
@@ -106,6 +105,7 @@ class VariantRuntime:
                     validate_tracker(runtime_cfg["variant"]["tracker"])
                 ),
             },
+            environment_descriptor=environment_descriptor,
         )
         if result.get("status") == "contract_error":
             raise ContractError(
@@ -128,6 +128,7 @@ class VariantRuntime:
         attempt_path: Path | None = None,
         lock_descriptor: int | None = None,
         runtime_target: dict[str, Any] | None = None,
+        environment_descriptor: int | None = None,
     ) -> dict[str, Any]:
         runtime_cfg = dict(cfg)
         runtime_cfg["runtime"] = {
@@ -156,6 +157,7 @@ class VariantRuntime:
                 ),
             },
             lock_descriptor=lock_descriptor,
+            environment_descriptor=environment_descriptor,
             log_path=run_dir / "worker.log",
         )
         return _successful(result)
@@ -175,6 +177,7 @@ class VariantRuntime:
         attempt_path: Path | None = None,
         lock_descriptor: int | None = None,
         runtime_target: dict[str, Any] | None = None,
+        environment_descriptor: int | None = None,
     ) -> dict[str, Any]:
         runtime_cfg = dict(cfg)
         runtime_cfg["runtime"] = {
@@ -207,6 +210,7 @@ class VariantRuntime:
                 ),
             },
             lock_descriptor=lock_descriptor,
+            environment_descriptor=environment_descriptor,
             log_path=run_dir / "worker.log",
         )
         return _successful(result)
@@ -226,6 +230,7 @@ class VariantRuntime:
         attempt_path: Path | None = None,
         lock_descriptor: int | None = None,
         runtime_target: dict[str, Any] | None = None,
+        environment_descriptor: int | None = None,
     ) -> dict[str, Any]:
         runtime_cfg = dict(cfg)
         runtime_cfg["runtime"] = {
@@ -254,6 +259,7 @@ class VariantRuntime:
                 ),
             },
             lock_descriptor=lock_descriptor,
+            environment_descriptor=environment_descriptor,
             log_path=run_dir / "worker.log",
         )
         return _successful(result)
@@ -268,6 +274,7 @@ class VariantRuntime:
         current_tracker_run_id: str | None,
         lock_descriptor: int,
         metadata: dict[str, Any],
+        environment_descriptor: int | None = None,
     ) -> str | None:
         tracker_backends = validate_tracker(cfg["variant"]["tracker"])
         if "mlflow" not in tracker_backends:
@@ -286,6 +293,7 @@ class VariantRuntime:
                 "tracker_backends": list(tracker_backends),
             },
             lock_descriptor=lock_descriptor,
+            environment_descriptor=environment_descriptor,
         )
         successful = _successful(result)
         tracker_run_id = successful.get("tracker_run_id")
@@ -301,6 +309,7 @@ class VariantRuntime:
         tracker_run_id: str | None,
         values: dict[str, Any],
         lock_descriptor: int,
+        environment_descriptor: int | None = None,
     ) -> None:
         if tracker_run_id is None:
             return
@@ -314,6 +323,7 @@ class VariantRuntime:
                 "repository_root": str(variant.path.parents[2]),
             },
             lock_descriptor=lock_descriptor,
+            environment_descriptor=environment_descriptor,
         )
 
     def finish_tracker(
@@ -324,6 +334,7 @@ class VariantRuntime:
         tracker_run_id: str | None,
         status: str,
         lock_descriptor: int,
+        environment_descriptor: int | None = None,
     ) -> None:
         if tracker_run_id is None:
             return
@@ -337,6 +348,7 @@ class VariantRuntime:
                 "repository_root": str(variant.path.parents[2]),
             },
             lock_descriptor=lock_descriptor,
+            environment_descriptor=environment_descriptor,
         )
 
     def _successful_operation(
@@ -346,6 +358,7 @@ class VariantRuntime:
         request: dict[str, Any],
         *,
         lock_descriptor: int,
+        environment_descriptor: int | None = None,
     ) -> dict[str, Any]:
         return _successful(
             self._invoke(
@@ -353,16 +366,18 @@ class VariantRuntime:
                 variant,
                 request,
                 lock_descriptor=lock_descriptor,
+                environment_descriptor=environment_descriptor,
             )
         )
 
-    @staticmethod
     def _invoke(
+        self,
         python: Path,
         variant: VariantRecord,
         request: dict[str, Any],
         *,
         lock_descriptor: int | None = None,
+        environment_descriptor: int | None = None,
         log_path: Path | None = None,
     ) -> dict[str, Any]:
         worker = Path(__file__).with_name("_runtime_worker.py")
@@ -378,7 +393,17 @@ class VariantRuntime:
                 encoding="utf-8",
             )
             command = [str(python), str(worker), str(request_path), str(result_path)]
-            pass_fds = (lock_descriptor,) if lock_descriptor is not None else ()
+            if environment_descriptor is None:
+                with self._lease_lock:
+                    descriptors = self._lease_descriptors.get(python, [])
+                    environment_descriptor = descriptors[-1] if descriptors else None
+            pass_fds = tuple(
+                dict.fromkeys(
+                    descriptor
+                    for descriptor in (lock_descriptor, environment_descriptor)
+                    if descriptor is not None
+                )
+            )
             if log_path is None:
                 returncode = subprocess.run(
                     command,
@@ -471,12 +496,3 @@ def _successful(result: dict[str, Any]) -> dict[str, Any]:
             f"Variant worker failed: {result.get('error_type', 'error')}"
         )
     return result
-
-
-def _require_real_directory(path: Path) -> None:
-    try:
-        mode = path.lstat().st_mode
-    except OSError as error:
-        raise RuntimeFailure(f"Variant environment is unavailable: {path}") from error
-    if path.is_symlink() or not stat.S_ISDIR(mode):
-        raise RuntimeFailure(f"Variant environment is invalid: {path}")

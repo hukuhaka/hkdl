@@ -60,10 +60,12 @@ class ResolvedTemplate:
 def storage_usage(repository: RepositoryPaths) -> dict[str, int]:
     """Return logical bytes for repository-owned authored and generated state."""
 
-    authored, environments = _tree_sizes(
+    authored, legacy_environments = _tree_sizes(
         repository.experiments,
         split_environments=True,
     )
+    shared_environments, _ = _tree_sizes(repository.root / ".hkdl/environments")
+    environments = legacy_environments + shared_environments
     outputs, _ = _tree_sizes(repository.outputs)
     return {
         "authored": authored,

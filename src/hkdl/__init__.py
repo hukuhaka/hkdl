@@ -16,6 +16,15 @@ from .config import (
     validate_template_variant_seed,
     validate_variant,
 )
+from .environments import (
+    EnvironmentFailure,
+    EnvironmentHandle,
+    EnvironmentIdentity,
+    EnvironmentStore,
+    PruneEntry,
+    PrunePlan,
+    PruneResult,
+)
 from .storage import (
     AlreadyExistsError,
     LockUnavailableError,
@@ -79,6 +88,10 @@ __all__ = [
     "Evaluation",
     "EvaluationFailure",
     "EvaluationInterrupted",
+    "EnvironmentFailure",
+    "EnvironmentHandle",
+    "EnvironmentIdentity",
+    "EnvironmentStore",
     "Export",
     "ExportFailure",
     "ExportInterrupted",
@@ -89,6 +102,9 @@ __all__ = [
     "LockUnavailableError",
     "NotFoundError",
     "OwnershipError",
+    "PruneEntry",
+    "PrunePlan",
+    "PruneResult",
     "RepositoryPaths",
     "Recovery",
     "RecoveryFailure",

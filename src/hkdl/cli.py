@@ -9,6 +9,7 @@ import json
 import sys
 import time
 from collections.abc import Callable, Iterable, Sequence
+from pathlib import Path
 from typing import Any
 
 from .authoring import Authoring
@@ -37,6 +38,7 @@ from .evaluation import (
     EvaluationInterrupted,
     LifecycleConflict,
 )
+from .environments import EnvironmentFailure, EnvironmentStore, PrunePlan
 from .export import Export, ExportFailure, ExportInterrupted
 from .migration import Migration
 from .recovery import Recovery, RecoveryFailure, RecoveryInterrupted
@@ -117,6 +119,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     except UpdateFailure as error:
         print(f"error: update failed: {error}", file=sys.stderr)
         return 6
+    except EnvironmentFailure as error:
+        print(f"error: environment operation failed: {error}", file=sys.stderr)
+        return 6
 
 
 def _dispatch(args: argparse.Namespace) -> int:
@@ -147,6 +152,46 @@ def _dispatch(args: argparse.Namespace) -> int:
         return 0
 
     authoring = Authoring(repository)
+
+    if (args.noun, args.verb) == ("environment", "prune"):
+        variants = [
+            variant
+            for experiment in authoring.list_experiments()
+            for variant in authoring.list_variants(str(experiment.document["name"]))
+        ]
+        runs = RunStore(repository).scan()
+        active_variants = {
+            (str(run.request["experiment"]), str(run.request["variant"]))
+            for run in runs
+            if run.state["status"] not in TERMINAL_STATUSES
+        }
+        environments = EnvironmentStore(repository)
+        plan = environments.plan_prune(
+            variants,
+            active_variants=active_variants,
+            remove_all=args.all,
+        )
+        if args.dry_run:
+            _prune_table(plan, repository.root)
+            return 0
+        if not plan.entries:
+            print(f"nothing to prune retained={plan.retained} busy={plan.busy}")
+            return 0
+        _prune_table(plan, repository.root, file=sys.stderr)
+        if not args.yes and not _confirm("Continue with environment prune?"):
+            print("Environment prune cancelled. Nothing was removed.")
+            return 0
+        result = environments.prune(
+            variants,
+            active_variants=active_variants,
+            remove_all=args.all,
+        )
+        print(
+            f"pruned environments={result.removed} "
+            f"bytes={result.bytes} size={_format_bytes(result.bytes)} "
+            f"retained={result.retained} busy={result.busy}"
+        )
+        return 0
 
     if (args.noun, args.verb) == ("template", "list"):
         templates = authoring.list_templates()
@@ -865,6 +910,45 @@ def _parser() -> argparse.ArgumentParser:
     storage.set_defaults(verb=None)
     _output_argument(storage)
 
+    environment = nouns.add_parser(
+        "environment",
+        help="Manage generated Variant environments",
+        description="Manage repository-local generated Variant environments.",
+    )
+    environment_verbs = environment.add_subparsers(
+        title="commands",
+        dest="verb",
+        required=True,
+    )
+    environment_prune = environment_verbs.add_parser(
+        "prune",
+        help="Remove unused generated environments",
+        description="Preview and remove safely reproducible Variant environments.",
+        epilog=_examples(
+            "hkdl environment prune --dry-run",
+            "hkdl environment prune",
+            "hkdl environment prune --all --yes",
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    environment_prune.add_argument(
+        "--all",
+        action="store_true",
+        help="Also remove inactive environments referenced by current Variants",
+    )
+    environment_confirmation = environment_prune.add_mutually_exclusive_group()
+    environment_confirmation.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Show removable environments without prompting or modifying state",
+    )
+    environment_confirmation.add_argument(
+        "-y",
+        "--yes",
+        action="store_true",
+        help="Confirm the shown prune without prompting",
+    )
+
     completion = nouns.add_parser(
         "completion",
         help="Generate shell completion registration",
@@ -1047,7 +1131,14 @@ def _output_argument(parser: argparse.ArgumentParser) -> None:
     )
 
 
-def _table(headers: tuple[str, ...], rows: Iterable[Sequence[object]]) -> None:
+def _table(
+    headers: tuple[str, ...],
+    rows: Iterable[Sequence[object]],
+    *,
+    file: Any = None,
+) -> None:
+    if file is None:
+        file = sys.stdout
     rendered_rows = [tuple(str(value) for value in row) for row in rows]
     if any(len(row) != len(headers) for row in rendered_rows):
         raise AssertionError("table row width does not match headers")
@@ -1063,9 +1154,42 @@ def _table(headers: tuple[str, ...], rows: Iterable[Sequence[object]]) -> None:
             for index, value in enumerate(row)
         )
 
-    print(render(headers))
+    print(render(headers), file=file)
     for row in rendered_rows:
-        print(render(row))
+        print(render(row), file=file)
+
+
+def _prune_table(
+    plan: PrunePlan,
+    root: Path,
+    *,
+    file: Any = None,
+) -> None:
+    if file is None:
+        file = sys.stdout
+    _table(
+        ("KIND", "PATH", "BYTES", "SIZE"),
+        (
+            (
+                entry.kind,
+                entry.path.relative_to(root),
+                entry.bytes,
+                _format_bytes(entry.bytes),
+            )
+            for entry in plan.entries
+        ),
+        file=file,
+    )
+    print(
+        f"total environments={len(plan.entries)} bytes={plan.bytes} "
+        f"size={_format_bytes(plan.bytes)} retained={plan.retained} busy={plan.busy}",
+        file=file,
+    )
+
+
+def _confirm(question: str) -> bool:
+    print(f"{question} [y/N] ", end="", file=sys.stderr, flush=True)
+    return sys.stdin.readline().strip().lower() in {"y", "yes"}
 
 
 def _format_bytes(size: int) -> str:

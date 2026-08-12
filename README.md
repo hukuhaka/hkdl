@@ -1,11 +1,12 @@
 # HKDL
 
 HKDL authors self-contained ML Variants and records immutable execution
-history. Version 1.1.1 supports authoring, multi-seed training, immutable
+history. Version 1.1.2 supports authoring, multi-seed training, immutable
 Models, named evaluation cases with optional result artifacts, Variant-owned
 export, new-Run retry, brief, full, and aggregate-table status projections,
-live local metric following, Run-owned worker logs, read-only storage reporting,
-shell completion, and opt-in MLflow tracking.
+live local metric following, Run-owned worker logs, shared locked Variant
+environments, explicit environment pruning, read-only storage reporting, shell
+completion, and opt-in MLflow tracking.
 
 ## Setup
 
@@ -102,9 +103,28 @@ hkdl storage
 hkdl storage --output json
 ```
 
-The report separates authored Experiment content, generated Variant
-environments, and outputs. Sizes are logical file bytes; symlinks are not
-followed. The command does not delete or prune anything.
+The report separates authored Experiment content, Variant environments, and
+outputs. Environment bytes count legacy per-Variant `.venv` directories plus
+the repository-local shared store once. Sizes are logical file bytes; symlinks
+are not followed. The command does not delete or prune anything.
+
+Variant actions reuse an immutable environment when their lock files, optional
+extras, exact Python runtime, platform, and `uv` version match. HKDL keeps the
+shared store under `.hkdl/environments/`; existing per-Variant `.venv`
+directories remain untouched until an explicit prune.
+
+Preview or confirm safe cleanup with:
+
+```text
+hkdl environment prune --dry-run
+hkdl environment prune
+hkdl environment prune --yes
+```
+
+The default prune removes legacy Variant environments, incomplete cache
+entries, and shared environments no longer referenced by an authored Variant.
+`hkdl environment prune --all` also selects referenced but inactive shared
+environments. Environments with an active execution lease are always skipped.
 
 Each train, evaluation, or export command above creates one immutable action
 Run. A successful Train Run also creates an immutable Model. Evaluation and

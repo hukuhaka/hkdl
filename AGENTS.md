@@ -78,6 +78,7 @@ Inspect the resulting state and Models:
 .venv/bin/hkdl run logs <experiment> <variant> <run-id>
 .venv/bin/hkdl model list <experiment> <variant>
 .venv/bin/hkdl storage
+.venv/bin/hkdl environment prune --dry-run
 ```
 
 `status` uses the compact brief view by default. Use `--full` for timestamps,
@@ -108,9 +109,16 @@ does not capture setup, preflight, direct terminal writes, or detached daemons.
 The log has no redaction or size limit: never print credentials, tokens, or
 other secrets from Variant code.
 
-`storage` reports logical bytes for authored Experiment content, Variant
-environments, generated outputs, and their total. It is read-only: do not
-describe it as cleanup, pruning, or available disk space.
+`storage` reports logical bytes for authored Experiment content, legacy and
+shared Variant environments, generated outputs, and their total. It is
+read-only: do not describe it as cleanup, pruning, or available disk space.
+
+Variant actions reuse repository-local immutable environments when their locked
+inputs and runtime identity match. Use `environment prune --dry-run` to inspect
+cleanup. The default confirmed prune removes legacy Variant environments,
+incomplete cache entries, and unreferenced shared environments. `--all` also
+selects referenced but inactive shared environments. Active environments are
+always skipped. Do not use `--yes` without prior confirmation from the user.
 
 Evaluate an existing Evaluation Case:
 

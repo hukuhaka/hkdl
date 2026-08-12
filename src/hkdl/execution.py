@@ -72,7 +72,7 @@ class RunExecution:
     ):
         self.repository = repository
         self.authoring = Authoring(repository)
-        self.runtime = runtime or VariantRuntime()
+        self.runtime = runtime or VariantRuntime(repository)
         self.store = store or RunStore(repository)
 
     def train(
@@ -84,10 +84,35 @@ class RunExecution:
         seed: int = 0,
         device: str = "auto",
     ) -> RunRecord:
+        variant = self.authoring.check_variant(experiment_name, variant_name)
+        try:
+            with self.runtime.acquire_environment(variant) as environment:
+                return self._train(
+                    experiment_name,
+                    variant_name,
+                    training_group,
+                    python=environment.python,
+                    seed=seed,
+                    device=device,
+                )
+        except RuntimeFailure as error:
+            raise ExecutionFailure("train", str(error)) from error
+
+    def _train(
+        self,
+        experiment_name: str,
+        variant_name: str,
+        training_group: str,
+        *,
+        python: Path,
+        seed: int,
+        device: str,
+    ) -> RunRecord:
         experiment, variant, python, source_digest, snapshot = self._prepare(
             experiment_name,
             variant_name,
             action="train",
+            python=python,
         )
         selected = validate_training_readiness(
             experiment.document,
@@ -170,10 +195,37 @@ class RunExecution:
         seed: int | str | None = None,
         device: str = "auto",
     ) -> list[RunRecord]:
+        variant = self.authoring.check_variant(experiment_name, variant_name)
+        try:
+            with self.runtime.acquire_environment(variant) as environment:
+                return self._evaluate(
+                    experiment_name,
+                    variant_name,
+                    training_group,
+                    evaluation_case_name,
+                    python=environment.python,
+                    seed=seed,
+                    device=device,
+                )
+        except RuntimeFailure as error:
+            raise ExecutionFailure("eval", str(error)) from error
+
+    def _evaluate(
+        self,
+        experiment_name: str,
+        variant_name: str,
+        training_group: str,
+        evaluation_case_name: str,
+        *,
+        python: Path,
+        seed: int | str | None,
+        device: str,
+    ) -> list[RunRecord]:
         experiment, variant, python, source_digest, snapshot = self._prepare(
             experiment_name,
             variant_name,
             action="eval",
+            python=python,
         )
         models = [
             model
@@ -311,11 +363,35 @@ class RunExecution:
         *,
         device: str = "auto",
     ) -> RunRecord:
+        self.store.load_model(experiment_name, variant_name, model_id)
+        variant = self.authoring.check_variant(experiment_name, variant_name)
+        try:
+            with self.runtime.acquire_environment(variant) as environment:
+                return self._export(
+                    experiment_name,
+                    variant_name,
+                    model_id,
+                    python=environment.python,
+                    device=device,
+                )
+        except RuntimeFailure as error:
+            raise ExecutionFailure("export", str(error)) from error
+
+    def _export(
+        self,
+        experiment_name: str,
+        variant_name: str,
+        model_id: str,
+        *,
+        python: Path,
+        device: str,
+    ) -> RunRecord:
         model = self.store.load_model(experiment_name, variant_name, model_id)
         experiment, variant, python, source_digest, snapshot = self._prepare(
             experiment_name,
             variant_name,
             action="export",
+            python=python,
         )
         selected = validate_export_readiness(
             experiment.document,
@@ -382,6 +458,27 @@ class RunExecution:
         variant_name: str,
         run_id: str,
     ) -> RunRecord:
+        self.store.load(experiment_name, variant_name, run_id)
+        variant = self.authoring.check_variant(experiment_name, variant_name)
+        try:
+            with self.runtime.acquire_environment(variant) as environment:
+                return self._retry(
+                    experiment_name,
+                    variant_name,
+                    run_id,
+                    python=environment.python,
+                )
+        except RuntimeFailure as error:
+            raise ExecutionFailure("retry", str(error)) from error
+
+    def _retry(
+        self,
+        experiment_name: str,
+        variant_name: str,
+        run_id: str,
+        *,
+        python: Path,
+    ) -> RunRecord:
         original = self.store.load(experiment_name, variant_name, run_id)
         abandoned_tracker: str | None = None
         try:
@@ -424,7 +521,6 @@ class RunExecution:
         if current_digest != original.request["source_digest"]:
             raise ContractError("Variant source changed since the original Run")
         try:
-            python = self.runtime.prepare_environment(current_variant)
             if abandoned_tracker is not None:
                 with try_directory_lock(original.path) as descriptor:
                     self.runtime.finish_tracker(
@@ -540,13 +636,10 @@ class RunExecution:
         variant_name: str,
         *,
         action: str,
+        python: Path,
     ) -> tuple[ExperimentRecord, VariantRecord, Path, str, dict[str, Any]]:
         variant = self.authoring.check_variant(experiment_name, variant_name)
         experiment = self.authoring.load_experiment(experiment_name)
-        try:
-            python = self.runtime.prepare_environment(variant)
-        except RuntimeFailure as error:
-            raise ExecutionFailure(action, str(error)) from error
         source_digest = compute_source_digest(variant.path / "src")
         snapshot = self.store.freeze(experiment, variant, source_digest)
         return experiment, variant, python, source_digest, snapshot

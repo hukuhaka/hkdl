@@ -34,7 +34,10 @@ from .storage import (
     validate_locked_source_tree,
 )
 
-RESERVED_VARIANT_NAMES = frozenset({"notes", "src", "variants"})
+EXPERIMENT_AUXILIARY_DIRECTORIES = ("docs", "tools")
+RESERVED_VARIANT_NAMES = frozenset(
+    {"notes", "src", "variants", *EXPERIMENT_AUXILIARY_DIRECTORIES}
+)
 
 
 @dataclass(frozen=True)
@@ -292,6 +295,10 @@ def _load_experiment(path: Path, *, expected_name: str) -> ExperimentRecord:
             "legacy Experiment layout is unsupported; migration is deferred"
         )
     _require_directory(path / "notes")
+    for name in EXPERIMENT_AUXILIARY_DIRECTORIES:
+        auxiliary = path / name
+        if os.path.lexists(auxiliary):
+            _require_directory(auxiliary)
     document = load_yaml_file(path / "experiment.yaml")
     validate_experiment(document)
     if document["name"] != expected_name:
@@ -333,7 +340,11 @@ def _catalog_entries(path: Path) -> list[Path]:
 def _variant_catalog_entries(path: Path) -> list[Path]:
     entries: list[Path] = []
     for entry in os.scandir(path):
-        if entry.name.startswith(".") or entry.name in {"experiment.yaml", "notes"}:
+        if entry.name.startswith(".") or entry.name in {
+            "experiment.yaml",
+            "notes",
+            *EXPERIMENT_AUXILIARY_DIRECTORIES,
+        }:
             continue
         if entry.name in RESERVED_VARIANT_NAMES:
             raise ContractError(

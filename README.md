@@ -1,12 +1,20 @@
 # HKDL
 
 HKDL authors self-contained ML Variants and records immutable execution
-history. Version 1.1.2 supports authoring, multi-seed training, immutable
+history. Version 1.1.3 supports authoring, multi-seed training, immutable
 Models, named evaluation cases with optional result artifacts, Variant-owned
 export, new-Run retry, brief, full, and aggregate-table status projections,
 live local metric following, Run-owned worker logs, shared locked Variant
 environments, explicit environment pruning, read-only storage reporting, shell
 completion, and opt-in MLflow tracking.
+
+An Experiment may also contain optional `docs/` and `tools/` directories for
+authored documentation and utilities. HKDL excludes these two real,
+non-symlink directories from Variant discovery and shell completion and
+reserves both names from Variant creation. Every other visible Experiment
+directory remains a Variant catalog entry and is validated as such. An
+existing Variant named `docs` or `tools` must be renamed before updating;
+HKDL does not migrate it automatically.
 
 ## Setup
 

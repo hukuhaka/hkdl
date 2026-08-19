@@ -1,7 +1,7 @@
 # HKDL
 
 HKDL authors self-contained ML Variants and records immutable execution
-history. Version 1.1.3 supports authoring, multi-seed training, immutable
+history. Version 1.1.4 supports authoring, multi-seed training, immutable
 Models, named evaluation cases with optional result artifacts, Variant-owned
 export, new-Run retry, brief, full, and aggregate-table status projections,
 live local metric following, Run-owned worker logs, shared locked Variant
@@ -15,6 +15,13 @@ reserves both names from Variant creation. Every other visible Experiment
 directory remains a Variant catalog entry and is validated as such. An
 existing Variant named `docs` or `tools` must be renamed before updating;
 HKDL does not migrate it automatically.
+
+For optional research-decision history, copy the
+[Experiment Decision Record starter](docs/examples/experiment-decision-record.yaml)
+into `experiments/<experiment>/docs/records/<RECORD-ID>.yaml` and follow the
+[authoring guidance](docs/experiment-decision-records.md). These notes are not
+discovered, validated, updated, or required by HKDL and do not affect execution
+or cleanup behavior.
 
 ## Setup
 

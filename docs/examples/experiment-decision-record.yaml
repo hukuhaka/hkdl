@@ -1,0 +1,25 @@
+# Copy this file to:
+# experiments/<experiment>/docs/records/<RECORD-ID>.yaml
+#
+# Replace the example values. Omit optional fields until they apply; do not use
+# null for a value that has not been checked.
+
+schema_version: 1
+id: BASE
+title: Baseline
+kind: training
+role: baseline
+state: active
+question: Does the baseline establish a useful comparison point?
+
+lineage:
+  parent: null
+  relation: root
+  changes: []
+
+provenance:
+  experiment: demo
+  variant: baseline
+
+decision:
+  outcome: not_run
